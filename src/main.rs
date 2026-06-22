@@ -412,11 +412,14 @@ fn draw_right_pane(f: &mut Frame, app: &App, area: Rect) {
 
     match &app.git_tree {
         Some(tree) => {
+            let freshness = if tree.scanned_at.elapsed().as_secs() <= 30 {
+                "  up to date"
+            } else {
+                ""
+            };
             let title = format!(
-                " Git activity — {} repos in {}  (scanned {}s ago) ",
-                tree.total_repos,
-                tree.root_display,
-                tree.scanned_at.elapsed().as_secs(),
+                " Git activity — {} repos in {}{} ",
+                tree.total_repos, tree.root_display, freshness,
             );
             let lines = render_git_tree(tree);
             let para = Paragraph::new(lines)
@@ -456,6 +459,12 @@ fn render_git_tree(tree: &GitTree) -> Vec<Line<'static>> {
             None => Color::DarkGray,
         };
         let dirty_marker = if repo.is_dirty { "  ◇ dirty" } else { "" };
+        let fork_marker = match &repo.fork_drift {
+            Some(d) if d.ahead != 0 || d.behind != 0 => {
+                format!("  upstream/{} ↑{} ↓{}", d.branch, d.ahead, d.behind)
+            }
+            _ => String::new(),
+        };
 
         lines.push(Line::from(vec![
             Span::styled(bullet.to_string(), Style::default().fg(bullet_color)),
@@ -469,6 +478,7 @@ fn render_git_tree(tree: &GitTree) -> Vec<Line<'static>> {
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(dirty_marker.to_string(), Style::default().fg(Color::Yellow)),
+            Span::styled(fork_marker, Style::default().fg(Color::Yellow)),
         ]));
 
         if repo.branches.is_empty() {
