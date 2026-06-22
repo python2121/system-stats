@@ -21,6 +21,7 @@ pub struct RepoSummary {
     pub most_recent_commit: Option<u64>,
     pub branches: Vec<BranchInfo>,
     pub is_dirty: bool,
+    pub upstream_remote: Option<String>,
     pub fork_drift: Option<ForkDrift>,
 }
 
@@ -93,15 +94,51 @@ fn summarize_repo(path: &Path) -> Option<RepoSummary> {
     }
     let most_recent_commit = branches.iter().filter_map(|b| b.last_commit).max();
     let is_dirty = git_is_dirty(path);
-    let fork_drift = git_fork_drift(path);
+    let upstream_url = git_upstream_remote_url(path);
+    let upstream_remote = upstream_url.as_deref().map(shorten_remote_url);
+    let fork_drift = if upstream_url.is_some() {
+        git_fork_drift(path)
+    } else {
+        None
+    };
     branches.truncate(MAX_BRANCHES_PER_REPO);
     Some(RepoSummary {
         name,
         most_recent_commit,
         branches,
         is_dirty,
+        upstream_remote,
         fork_drift,
     })
+}
+
+fn git_upstream_remote_url(path: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "get-url", "upstream"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+// Turn a remote URL into "owner/repo" — handles both SSH (`git@host:owner/repo.git`)
+// and HTTPS (`https://host/owner/repo.git`) shapes without pulling in a URL crate.
+fn shorten_remote_url(url: &str) -> String {
+    let url = url.trim().trim_end_matches(".git");
+    let mut parts = url.rsplit('/').filter(|p| !p.is_empty());
+    let last = parts.next();
+    let second_last = parts.next();
+    match (second_last, last) {
+        (Some(s), Some(l)) => {
+            let owner = s.rsplit(':').next().unwrap_or(s);
+            format!("{owner}/{l}")
+        }
+        _ => url.to_string(),
+    }
 }
 
 fn git_fork_drift(path: &Path) -> Option<ForkDrift> {

@@ -412,14 +412,11 @@ fn draw_right_pane(f: &mut Frame, app: &App, area: Rect) {
 
     match &app.git_tree {
         Some(tree) => {
-            let freshness = if tree.scanned_at.elapsed().as_secs() <= 30 {
-                "  up to date"
-            } else {
-                ""
-            };
+            // Round to 5-second increments so the title doesn't flicker every tick.
+            let rounded = (tree.scanned_at.elapsed().as_secs() / 5) * 5;
             let title = format!(
-                " Git activity — {} repos in {}{} ",
-                tree.total_repos, tree.root_display, freshness,
+                " Git activity — {} repos in {}  (scanned {}s ago) ",
+                tree.total_repos, tree.root_display, rounded,
             );
             let lines = render_git_tree(tree);
             let para = Paragraph::new(lines)
@@ -436,6 +433,89 @@ fn draw_right_pane(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+struct TreeRow {
+    spans: Vec<Span<'static>>,
+    children: Vec<TreeRow>,
+}
+
+impl TreeRow {
+    fn leaf(spans: Vec<Span<'static>>) -> Self {
+        Self { spans, children: Vec::new() }
+    }
+    fn with_children(spans: Vec<Span<'static>>, children: Vec<TreeRow>) -> Self {
+        Self { spans, children }
+    }
+}
+
+fn render_tree_row(
+    row: TreeRow,
+    prefix: &str,
+    is_last: bool,
+    out: &mut Vec<Line<'static>>,
+) {
+    let connector = if is_last { "└─ " } else { "├─ " };
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(
+        format!("{prefix}{connector}"),
+        Style::default().fg(Color::DarkGray),
+    )];
+    spans.extend(row.spans);
+    out.push(Line::from(spans));
+
+    // Carry a vertical spine through children only if this row has siblings below.
+    let continuation = if is_last { "  " } else { "│ " };
+    let child_prefix = format!("{prefix}{continuation}");
+    let last_child = row.children.len().saturating_sub(1);
+    for (i, child) in row.children.into_iter().enumerate() {
+        render_tree_row(child, &child_prefix, i == last_child, out);
+    }
+}
+
+fn branch_spans(branch: &git::BranchInfo, now: u64) -> Vec<Span<'static>> {
+    let branch_age = branch
+        .last_commit
+        .map(|t| format_age(now.saturating_sub(t)))
+        .unwrap_or_default();
+    let marker = if branch.is_current { "→" } else { " " };
+    let track = match (branch.ahead, branch.behind) {
+        (0, 0) => String::new(),
+        (a, 0) => format!("  {a} ahead"),
+        (0, b) => format!("  {b} behind"),
+        (a, b) => format!("  {a} ahead, {b} behind"),
+    };
+    let active_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let (marker_style, name_style) = if branch.is_current {
+        (active_style, active_style)
+    } else {
+        (Style::default().fg(Color::DarkGray), Style::default())
+    };
+
+    vec![
+        Span::styled(format!("{marker} "), marker_style),
+        Span::styled(branch.name.clone(), name_style),
+        Span::styled(track, Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!("   {branch_age}   "),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            truncate(&branch.last_message, 40),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]
+}
+
+// Pick the conventional trunk branch so feature branches nest under it.
+fn pick_trunk_idx(branches: &[git::BranchInfo]) -> Option<usize> {
+    for name in ["main", "master", "develop", "trunk"] {
+        if let Some(i) = branches.iter().position(|b| b.name == name) {
+            return Some(i);
+        }
+    }
+    None
+}
+
 fn render_git_tree(tree: &GitTree) -> Vec<Line<'static>> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -448,37 +528,15 @@ fn render_git_tree(tree: &GitTree) -> Vec<Line<'static>> {
         let age_str = age_secs
             .map(format_age)
             .unwrap_or_else(|| "—".to_string());
-        let bullet = match age_secs {
-            Some(s) if s < 86_400 => "●",
-            Some(_) => "○",
-            None => "·",
-        };
-        let bullet_color = match age_secs {
-            Some(s) if s < 86_400 => Color::Green,
-            Some(_) => Color::DarkGray,
-            None => Color::DarkGray,
-        };
-        let dirty_marker = if repo.is_dirty { "  uncommitted changes" } else { "" };
-        let fork_marker = match &repo.fork_drift {
-            Some(d) if d.ahead != 0 && d.behind == 0 => {
-                format!("  fork's {} is {} ahead of original", d.branch, d.ahead)
-            }
-            Some(d) if d.ahead == 0 && d.behind != 0 => {
-                format!(
-                    "  fork's {} is {} behind original (pull from upstream)",
-                    d.branch, d.behind
-                )
-            }
-            Some(d) if d.ahead != 0 && d.behind != 0 => {
-                format!(
-                    "  fork's {} has diverged: {} ahead, {} behind original",
-                    d.branch, d.ahead, d.behind
-                )
-            }
-            _ => String::new(),
+        let (bullet, bullet_color) = match age_secs {
+            Some(s) if s < 86_400 => ("●", Color::Green),
+            Some(_) => ("○", Color::DarkGray),
+            None => ("·", Color::DarkGray),
         };
 
-        lines.push(Line::from(vec![
+        // Repo header — name, age, and (if applicable) the upstream pointer
+        // all on one line.
+        let mut header_spans = vec![
             Span::styled(bullet.to_string(), Style::default().fg(bullet_color)),
             Span::raw(" "),
             Span::styled(
@@ -486,55 +544,84 @@ fn render_git_tree(tree: &GitTree) -> Vec<Line<'static>> {
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("  {age_str}"),
+                format!("   {age_str}"),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled(dirty_marker.to_string(), Style::default().fg(Color::Yellow)),
-            Span::styled(fork_marker, Style::default().fg(Color::Yellow)),
-        ]));
+        ];
+        if let Some(upstream) = &repo.upstream_remote {
+            header_spans.push(Span::styled(
+                "   forked from ".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+            header_spans.push(Span::styled(
+                upstream.clone(),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        lines.push(Line::from(header_spans));
+
+        let mut rows: Vec<TreeRow> = Vec::new();
+
+        if repo.is_dirty {
+            rows.push(TreeRow::leaf(vec![Span::styled(
+                "uncommitted changes".to_string(),
+                Style::default().fg(Color::Yellow),
+            )]));
+        }
+
+        if let Some(d) = &repo.fork_drift {
+            if d.ahead != 0 || d.behind != 0 {
+                let text = match (d.ahead, d.behind) {
+                    (a, 0) => format!("{} is {} ahead of original", d.branch, a),
+                    (0, b) => {
+                        format!("{} is {} behind original (pull from upstream)", d.branch, b)
+                    }
+                    (a, b) => format!(
+                        "{} has diverged: {} ahead, {} behind original",
+                        d.branch, a, b
+                    ),
+                };
+                rows.push(TreeRow::leaf(vec![Span::styled(
+                    text,
+                    Style::default().fg(Color::Yellow),
+                )]));
+            }
+        }
 
         if repo.branches.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "      (no commits)".to_string(),
+            rows.push(TreeRow::leaf(vec![Span::styled(
+                "(no commits)".to_string(),
                 Style::default().fg(Color::DarkGray),
-            )));
+            )]));
+        } else {
+            // Nest non-trunk branches under the trunk so feature branches read
+            // as "branched off main" visually.
+            match pick_trunk_idx(&repo.branches) {
+                Some(idx) => {
+                    let trunk = &repo.branches[idx];
+                    let children: Vec<TreeRow> = repo
+                        .branches
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != idx)
+                        .map(|(_, b)| TreeRow::leaf(branch_spans(b, now)))
+                        .collect();
+                    rows.push(TreeRow::with_children(branch_spans(trunk, now), children));
+                }
+                None => {
+                    for branch in &repo.branches {
+                        rows.push(TreeRow::leaf(branch_spans(branch, now)));
+                    }
+                }
+            }
         }
 
-        for branch in &repo.branches {
-            let branch_age = branch
-                .last_commit
-                .map(|t| format_age(now.saturating_sub(t)))
-                .unwrap_or_default();
-            let marker = if branch.is_current { "*" } else { " " };
-            let track = match (branch.ahead, branch.behind) {
-                (0, 0) => String::new(),
-                (a, 0) => format!("  {a} ahead"),
-                (0, b) => format!("  {b} behind"),
-                (a, b) => format!("  {a} ahead, {b} behind"),
-            };
-            let name_style = if branch.is_current {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default()
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("    {marker} "),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(branch.name.clone(), name_style),
-                Span::styled(track, Style::default().fg(Color::Yellow)),
-                Span::styled(
-                    format!("  {branch_age}  "),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    truncate(&branch.last_message, 40),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
+        // Top-level indent of 2 spaces.
+        let last_idx = rows.len().saturating_sub(1);
+        for (i, row) in rows.into_iter().enumerate() {
+            render_tree_row(row, "  ", i == last_idx, &mut lines);
         }
+
         lines.push(Line::from(""));
     }
 
