@@ -1,15 +1,21 @@
+mod git;
+
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     symbols,
-    widgets::{Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Row, Table},
+    text::{Line, Span},
+    widgets::{Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table},
 };
 use sysinfo::{CpuRefreshKind, MINIMUM_CPU_UPDATE_INTERVAL, Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+
+use git::{GitTree, spawn_scanner};
 
 const HISTORY_WINDOW_SECS: u64 = 300;
 const CHART_INTERVAL_MS: u64 = 500;
@@ -44,6 +50,8 @@ struct App {
     last_callout_update: Instant,
     processes: Vec<ProcessInfo>,
     last_proc_sample: Instant,
+    git_rx: Receiver<GitTree>,
+    git_tree: Option<GitTree>,
     should_quit: bool,
 }
 
@@ -67,6 +75,7 @@ impl App {
         std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
 
         let networks = Networks::new_with_refreshed_list();
+        let git_rx = spawn_scanner();
 
         let now = Instant::now();
         let mut app = Self {
@@ -83,6 +92,8 @@ impl App {
             last_callout_update: now,
             processes: Vec::new(),
             last_proc_sample: now,
+            git_rx,
+            git_tree: None,
             should_quit: false,
         };
         app.sample_cpu();
@@ -157,6 +168,12 @@ impl App {
         self.last_callout_update = Instant::now();
     }
 
+    fn drain_git_updates(&mut self) {
+        while let Ok(tree) = self.git_rx.try_recv() {
+            self.git_tree = Some(tree);
+        }
+    }
+
     fn handle_events(&mut self) -> std::io::Result<()> {
         if event::poll(EVENT_POLL)? {
             if let Event::Key(key) = event::read()? {
@@ -201,6 +218,7 @@ fn main() -> std::io::Result<()> {
 
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     while !app.should_quit {
+        app.drain_git_updates();
         terminal.draw(|f| draw(f, app))?;
         app.handle_events()?;
         if app.last_chart_sample.elapsed() >= CHART_INTERVAL {
@@ -220,7 +238,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
 fn draw(f: &mut Frame, app: &App) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(f.area());
 
     let left = Layout::default()
@@ -236,7 +254,7 @@ fn draw(f: &mut Frame, app: &App) {
     draw_cpu_chart(f, app, charts[0]);
     draw_network_chart(f, app, charts[1]);
     draw_process_table(f, app, left[1]);
-    draw_right_pane(f, columns[1]);
+    draw_right_pane(f, app, columns[1]);
 }
 
 fn history_to_points(history: &VecDeque<f64>) -> Vec<(f64, f64)> {
@@ -387,12 +405,137 @@ fn draw_process_table(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(table, area);
 }
 
-fn draw_right_pane(f: &mut Frame, area: Rect) {
-    let block = Block::default()
+fn draw_right_pane(f: &mut Frame, app: &App, area: Rect) {
+    let base_block = Block::default()
         .borders(Borders::ALL)
-        .style(Style::reset())
-        .title(" (reserved) ");
-    f.render_widget(block, area);
+        .style(Style::reset());
+
+    match &app.git_tree {
+        Some(tree) => {
+            let title = format!(
+                " Git activity — {} repos in {}  (scanned {}s ago) ",
+                tree.total_repos,
+                tree.root_display,
+                tree.scanned_at.elapsed().as_secs(),
+            );
+            let lines = render_git_tree(tree);
+            let para = Paragraph::new(lines)
+                .style(Style::reset())
+                .block(base_block.title(title));
+            f.render_widget(para, area);
+        }
+        None => {
+            let para = Paragraph::new("scanning ~/Documents/code …")
+                .style(Style::reset())
+                .block(base_block.title(" Git activity "));
+            f.render_widget(para, area);
+        }
+    }
+}
+
+fn render_git_tree(tree: &GitTree) -> Vec<Line<'static>> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut lines: Vec<Line> = Vec::new();
+
+    for repo in &tree.repos {
+        let age_secs = repo.most_recent_commit.map(|t| now.saturating_sub(t));
+        let age_str = age_secs
+            .map(format_age)
+            .unwrap_or_else(|| "—".to_string());
+        let bullet = match age_secs {
+            Some(s) if s < 86_400 => "●",
+            Some(_) => "○",
+            None => "·",
+        };
+        let bullet_color = match age_secs {
+            Some(s) if s < 86_400 => Color::Green,
+            Some(_) => Color::DarkGray,
+            None => Color::DarkGray,
+        };
+        let dirty_marker = if repo.is_dirty { "  ◇ dirty" } else { "" };
+
+        lines.push(Line::from(vec![
+            Span::styled(bullet.to_string(), Style::default().fg(bullet_color)),
+            Span::raw(" "),
+            Span::styled(
+                repo.name.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {age_str}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(dirty_marker.to_string(), Style::default().fg(Color::Yellow)),
+        ]));
+
+        if repo.branches.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "      (no commits)".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        for branch in &repo.branches {
+            let branch_age = branch
+                .last_commit
+                .map(|t| format_age(now.saturating_sub(t)))
+                .unwrap_or_default();
+            let marker = if branch.is_current { "*" } else { " " };
+            let track = match (branch.ahead, branch.behind) {
+                (0, 0) => String::new(),
+                (a, 0) => format!("  ↑{a}"),
+                (0, b) => format!("  ↓{b}"),
+                (a, b) => format!("  ↑{a} ↓{b}"),
+            };
+            let name_style = if branch.is_current {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("    {marker} "),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(branch.name.clone(), name_style),
+                Span::styled(track, Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("  {branch_age}  "),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    truncate(&branch.last_message, 40),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    lines
+}
+
+fn format_age(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s if s < 2_592_000 => format!("{}d ago", s / 86_400),
+        s => format!("{}mo ago", s / 2_592_000),
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {
