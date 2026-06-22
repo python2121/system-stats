@@ -458,10 +458,22 @@ fn render_git_tree(tree: &GitTree) -> Vec<Line<'static>> {
             Some(_) => Color::DarkGray,
             None => Color::DarkGray,
         };
-        let dirty_marker = if repo.is_dirty { "  ◇ dirty" } else { "" };
+        let dirty_marker = if repo.is_dirty { "  uncommitted changes" } else { "" };
         let fork_marker = match &repo.fork_drift {
-            Some(d) if d.ahead != 0 || d.behind != 0 => {
-                format!("  upstream/{} ↑{} ↓{}", d.branch, d.ahead, d.behind)
+            Some(d) if d.ahead != 0 && d.behind == 0 => {
+                format!("  fork's {} is {} ahead of original", d.branch, d.ahead)
+            }
+            Some(d) if d.ahead == 0 && d.behind != 0 => {
+                format!(
+                    "  fork's {} is {} behind original (pull from upstream)",
+                    d.branch, d.behind
+                )
+            }
+            Some(d) if d.ahead != 0 && d.behind != 0 => {
+                format!(
+                    "  fork's {} has diverged: {} ahead, {} behind original",
+                    d.branch, d.ahead, d.behind
+                )
             }
             _ => String::new(),
         };
@@ -496,9 +508,9 @@ fn render_git_tree(tree: &GitTree) -> Vec<Line<'static>> {
             let marker = if branch.is_current { "*" } else { " " };
             let track = match (branch.ahead, branch.behind) {
                 (0, 0) => String::new(),
-                (a, 0) => format!("  ↑{a}"),
-                (0, b) => format!("  ↓{b}"),
-                (a, b) => format!("  ↑{a} ↓{b}"),
+                (a, 0) => format!("  {a} ahead"),
+                (0, b) => format!("  {b} behind"),
+                (a, b) => format!("  {a} ahead, {b} behind"),
             };
             let name_style = if branch.is_current {
                 Style::default().fg(Color::Cyan)
