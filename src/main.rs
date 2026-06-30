@@ -149,9 +149,40 @@ fn render_heatmap(tree: &GitTree, area_width: u16) -> (String, Vec<Line<'static>
         .max()
         .unwrap_or(0);
 
+    // Sunday's month per column — drives placement of month labels.
+    let months: Vec<u32> = (0..weeks)
+        .map(|col| {
+            let weeks_ago = (weeks - 1 - col) as i64;
+            let sunday = today_day - weeks_ago * 7 - today_dow;
+            civil_from_days(sunday).1
+        })
+        .collect();
+
+    // Per-day separators: separators[row][col] is true when the day in the
+    // next column's same row belongs to a different month. Because the
+    // boundary can fall mid-week, the line shifts between rows — a stepped
+    // wiggle that traces the real month boundary instead of pretending every
+    // month starts on Sunday.
+    let mut separators: Vec<Vec<bool>> = vec![vec![false; weeks]; 7];
+    for row in 0..7 {
+        for col in 0..weeks.saturating_sub(1) {
+            if grid[row][col].is_none() || grid[row][col + 1].is_none() {
+                continue;
+            }
+            let weeks_ago_left = (weeks - 1 - col) as i64;
+            let day_left = today_day - weeks_ago_left * 7 - (today_dow - row as i64);
+            let day_right = day_left + 7;
+            if civil_from_days(day_left).1 != civil_from_days(day_right).1 {
+                separators[row][col] = true;
+            }
+        }
+    }
+
     let day_labels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(8);
-    lines.push(month_label_row(weeks, today_day, today_dow));
+    // The label row uses Sunday's separators since labels are placed at
+    // each column whose Sunday opens a new month.
+    lines.push(month_label_row(&months, &separators[0]));
     for row in 0..7 {
         // Show only Mon/Wed/Fri labels to mirror GitHub's compact layout.
         let label = if matches!(row, 1 | 3 | 5) {
@@ -171,7 +202,11 @@ fn render_heatmap(tree: &GitTree, area_width: u16) -> (String, Vec<Line<'static>
                 ),
                 None => Span::raw(" "),
             });
-            spans.push(Span::raw(" "));
+            spans.push(if separators[row][col] {
+                Span::styled("│", Style::default().fg(Color::DarkGray))
+            } else {
+                Span::raw(" ")
+            });
         }
         lines.push(Line::from(spans));
     }
@@ -186,19 +221,19 @@ const MONTH_NAMES: [&str; 12] = [
 
 // Place a 3-char month label above the column where that month's first
 // Sunday falls in the visible window. `next_free` guards against overlap.
-fn month_label_row(weeks: usize, today_day: i64, today_dow: i64) -> Line<'static> {
-    // Cell area is `weeks * 2` chars wide (each week renders as "■ ").
+fn month_label_row(months: &[u32], separators: &[bool]) -> Line<'static> {
+    let weeks = months.len();
     let width = weeks * 2;
     let mut chars: Vec<char> = vec![' '; width];
+
+    // Place month labels at each rollover. Cell positions take priority
+    // over gap positions, so labels and separators never collide.
     let mut prev_month: u32 = 0;
     let mut next_free: usize = 0;
     for col in 0..weeks {
-        let weeks_ago = (weeks - 1 - col) as i64;
-        let sunday = today_day - weeks_ago * 7 - today_dow;
-        let (_, month, _) = civil_from_days(sunday);
         let pos = col * 2;
-        if month != prev_month && pos >= next_free {
-            let label = MONTH_NAMES[month as usize - 1];
+        if months[col] != prev_month && pos >= next_free {
+            let label = MONTH_NAMES[months[col] as usize - 1];
             for (i, ch) in label.chars().enumerate() {
                 if pos + i < width {
                     chars[pos + i] = ch;
@@ -206,13 +241,25 @@ fn month_label_row(weeks: usize, today_day: i64, today_dow: i64) -> Line<'static
             }
             next_free = pos + label.len() + 1;
         }
-        prev_month = month;
+        prev_month = months[col];
     }
-    let s: String = chars.into_iter().collect();
-    Line::from(vec![
-        Span::raw("    "),
-        Span::styled(s, Style::default().fg(Color::DarkGray)),
-    ])
+
+    let gray = Style::default().fg(Color::DarkGray);
+    let mut spans: Vec<Span<'static>> = vec![Span::raw("    ")];
+    for col in 0..weeks {
+        // Cell char (either a label letter or blank).
+        spans.push(Span::styled(chars[col * 2].to_string(), gray));
+        // Gap: label continuation wins, else separator, else blank.
+        let gap = chars[col * 2 + 1];
+        spans.push(if gap != ' ' {
+            Span::styled(gap.to_string(), gray)
+        } else if separators[col] {
+            Span::styled("│", gray)
+        } else {
+            Span::raw(" ")
+        });
+    }
+    Line::from(spans)
 }
 
 // Howard Hinnant's civil_from_days. Days are signed from 1970-01-01.
