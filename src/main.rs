@@ -572,12 +572,12 @@ fn render_git_tree(tree: &GitTree) -> Vec<Line<'static>> {
         if let Some(d) = &repo.fork_drift {
             if d.ahead != 0 || d.behind != 0 {
                 let text = match (d.ahead, d.behind) {
-                    (a, 0) => format!("{} is {} ahead of original", d.branch, a),
+                    (a, 0) => format!("Fork {} is {} ahead of original", d.branch, a),
                     (0, b) => {
-                        format!("{} is {} behind original (pull from upstream)", d.branch, b)
+                        format!("Fork {} is {} behind original (pull from upstream)", d.branch, b)
                     }
                     (a, b) => format!(
-                        "{} has diverged: {} ahead, {} behind original",
+                        "Fork {} has diverged: {} ahead, {} behind original",
                         d.branch, a, b
                     ),
                 };
