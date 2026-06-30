@@ -1,171 +1,35 @@
 mod git;
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::Receiver;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    symbols,
     text::{Line, Span},
-    widgets::{Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table},
+    widgets::{Block, Borders, Paragraph},
 };
-use sysinfo::{CpuRefreshKind, MINIMUM_CPU_UPDATE_INTERVAL, Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 use git::{GitTree, spawn_scanner};
 
-const HISTORY_WINDOW_SECS: u64 = 300;
-const CHART_INTERVAL_MS: u64 = 500;
-const CALLOUT_INTERVAL_MS: u64 = 4_000;
-const CPU_CALLOUT_WINDOW_MS: u64 = 4_000;
-const NET_CALLOUT_WINDOW_MS: u64 = 10_000;
-const PROC_INTERVAL_MS: u64 = 3_000;
-const EVENT_POLL_MS: u64 = 250;
-
-const CHART_INTERVAL: Duration = Duration::from_millis(CHART_INTERVAL_MS);
-const CALLOUT_INTERVAL: Duration = Duration::from_millis(CALLOUT_INTERVAL_MS);
-const PROC_INTERVAL: Duration = Duration::from_millis(PROC_INTERVAL_MS);
-const EVENT_POLL: Duration = Duration::from_millis(EVENT_POLL_MS);
-
-const HISTORY_SAMPLES: usize = (HISTORY_WINDOW_SECS * 1000 / CHART_INTERVAL_MS) as usize;
-const CPU_CALLOUT_SAMPLES: usize = (CPU_CALLOUT_WINDOW_MS / CHART_INTERVAL_MS) as usize;
-const NET_CALLOUT_SAMPLES: usize = (NET_CALLOUT_WINDOW_MS / CHART_INTERVAL_MS) as usize;
-
-const NET_YMAX_FLOOR_MBPS: f64 = 10.0;
+const EVENT_POLL: Duration = Duration::from_millis(250);
+const HEATMAP_WEEKS_MAX: usize = 27;
 
 struct App {
-    system: System,
-    networks: Networks,
-    cpu_history: VecDeque<f64>,
-    net_rx_history: VecDeque<f64>,
-    net_tx_history: VecDeque<f64>,
-    last_chart_sample: Instant,
-    last_net_sample: Instant,
-    cpu_callout: f64,
-    net_rx_callout: f64,
-    net_tx_callout: f64,
-    last_callout_update: Instant,
-    processes: Vec<ProcessInfo>,
-    last_proc_sample: Instant,
     git_rx: Receiver<GitTree>,
     git_tree: Option<GitTree>,
     should_quit: bool,
 }
 
-struct ProcessInfo {
-    name: String,
-    cpu: f32,
-    memory_bytes: u64,
-}
-
 impl App {
     fn new() -> Self {
-        let mut system = System::new_with_specifics(
-            RefreshKind::nothing()
-                .with_cpu(CpuRefreshKind::everything())
-                .with_processes(ProcessRefreshKind::everything()),
-        );
-
-        // CPU usage is computed as a delta between two samples — the first
-        // reading is always zero, so prime it before the UI starts drawing.
-        system.refresh_cpu_all();
-        std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
-
-        let networks = Networks::new_with_refreshed_list();
-        let git_rx = spawn_scanner();
-
-        let now = Instant::now();
-        let mut app = Self {
-            system,
-            networks,
-            cpu_history: VecDeque::with_capacity(HISTORY_SAMPLES),
-            net_rx_history: VecDeque::with_capacity(HISTORY_SAMPLES),
-            net_tx_history: VecDeque::with_capacity(HISTORY_SAMPLES),
-            last_chart_sample: now,
-            last_net_sample: now,
-            cpu_callout: 0.0,
-            net_rx_callout: 0.0,
-            net_tx_callout: 0.0,
-            last_callout_update: now,
-            processes: Vec::new(),
-            last_proc_sample: now,
-            git_rx,
+        Self {
+            git_rx: spawn_scanner(),
             git_tree: None,
             should_quit: false,
-        };
-        app.sample_cpu();
-        app.sample_network();
-        app.sample_processes();
-        app.update_callouts();
-        app
-    }
-
-    fn sample_cpu(&mut self) {
-        self.system.refresh_cpu_all();
-        let cpu = self.system.global_cpu_usage() as f64;
-        push_bounded(&mut self.cpu_history, cpu);
-        self.last_chart_sample = Instant::now();
-    }
-
-    fn sample_network(&mut self) {
-        let now = Instant::now();
-        // Guard against a zero / near-zero divisor on the first sample.
-        let elapsed = (now - self.last_net_sample).as_secs_f64().max(0.001);
-        self.networks.refresh(true);
-
-        let (mut rx_bytes, mut tx_bytes) = (0u64, 0u64);
-        for (_, data) in &self.networks {
-            rx_bytes += data.received();
-            tx_bytes += data.transmitted();
         }
-
-        let rx_mbps = bytes_to_mbps(rx_bytes, elapsed);
-        let tx_mbps = bytes_to_mbps(tx_bytes, elapsed);
-        push_bounded(&mut self.net_rx_history, rx_mbps);
-        push_bounded(&mut self.net_tx_history, tx_mbps);
-        self.last_net_sample = now;
-    }
-
-    fn sample_processes(&mut self) {
-        self.system
-            .refresh_processes(ProcessesToUpdate::All, true);
-
-        // Collapse processes sharing a name (e.g. all "Google Chrome Helper"
-        // workers) into one row, summing CPU% and memory.
-        let mut agg: HashMap<String, (f32, u64)> = HashMap::new();
-        for p in self.system.processes().values() {
-            let name = p.name().to_string_lossy().into_owned();
-            let entry = agg.entry(name).or_insert((0.0, 0));
-            entry.0 += p.cpu_usage();
-            entry.1 += p.memory();
-        }
-
-        let mut procs: Vec<ProcessInfo> = agg
-            .into_iter()
-            .map(|(name, (cpu, memory_bytes))| ProcessInfo {
-                name,
-                cpu,
-                memory_bytes,
-            })
-            .collect();
-        procs.sort_by(|a, b| {
-            b.cpu
-                .partial_cmp(&a.cpu)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        procs.truncate(10);
-        self.processes = procs;
-        self.last_proc_sample = Instant::now();
-    }
-
-    fn update_callouts(&mut self) {
-        self.cpu_callout = average_tail(&self.cpu_history, CPU_CALLOUT_SAMPLES);
-        self.net_rx_callout = average_tail(&self.net_rx_history, NET_CALLOUT_SAMPLES);
-        self.net_tx_callout = average_tail(&self.net_tx_history, NET_CALLOUT_SAMPLES);
-        self.last_callout_update = Instant::now();
     }
 
     fn drain_git_updates(&mut self) {
@@ -188,26 +52,6 @@ impl App {
     }
 }
 
-fn push_bounded(buf: &mut VecDeque<f64>, value: f64) {
-    if buf.len() == HISTORY_SAMPLES {
-        buf.pop_front();
-    }
-    buf.push_back(value);
-}
-
-fn average_tail(buf: &VecDeque<f64>, n: usize) -> f64 {
-    let take = n.min(buf.len());
-    if take == 0 {
-        return 0.0;
-    }
-    let sum: f64 = buf.iter().rev().take(take).sum();
-    sum / take as f64
-}
-
-fn bytes_to_mbps(bytes: u64, seconds: f64) -> f64 {
-    (bytes as f64 * 8.0) / (seconds * 1_000_000.0)
-}
-
 fn main() -> std::io::Result<()> {
     let mut terminal = ratatui::init();
     let mut app = App::new();
@@ -221,16 +65,6 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
         app.drain_git_updates();
         terminal.draw(|f| draw(f, app))?;
         app.handle_events()?;
-        if app.last_chart_sample.elapsed() >= CHART_INTERVAL {
-            app.sample_cpu();
-            app.sample_network();
-        }
-        if app.last_callout_update.elapsed() >= CALLOUT_INTERVAL {
-            app.update_callouts();
-        }
-        if app.last_proc_sample.elapsed() >= PROC_INTERVAL {
-            app.sample_processes();
-        }
     }
     Ok(())
 }
@@ -238,171 +72,231 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
 fn draw(f: &mut Frame, app: &App) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(f.area());
 
     let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Max(13)])
+        .constraints([Constraint::Length(11), Constraint::Min(0)])
         .split(columns[0]);
 
-    let charts = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(left[0]);
-
-    draw_cpu_chart(f, app, charts[0]);
-    draw_network_chart(f, app, charts[1]);
-    draw_process_table(f, app, left[1]);
+    draw_heatmap(f, app, left[0]);
+    draw_commits(f, app, left[1]);
     draw_right_pane(f, app, columns[1]);
 }
 
-fn history_to_points(history: &VecDeque<f64>) -> Vec<(f64, f64)> {
-    let len = history.len();
-    let interval = CHART_INTERVAL.as_secs_f64();
-    history
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| (-((len - 1 - i) as f64) * interval, v))
-        .collect()
+fn draw_heatmap(f: &mut Frame, app: &App, area: Rect) {
+    let base_block = Block::default()
+        .borders(Borders::ALL)
+        .style(Style::reset());
+
+    let (title, lines) = match &app.git_tree {
+        Some(tree) => render_heatmap(tree, area.width),
+        None => (
+            " Commits ".to_string(),
+            vec![Line::from(Span::styled(
+                "scanning …",
+                Style::default().fg(Color::DarkGray),
+            ))],
+        ),
+    };
+
+    let para = Paragraph::new(lines)
+        .style(Style::reset())
+        .block(base_block.title(title));
+    f.render_widget(para, area);
 }
 
-fn draw_cpu_chart(f: &mut Frame, app: &App, area: Rect) {
-    let data = history_to_points(&app.cpu_history);
+// Build the 7×N heatmap. Today is in the rightmost (possibly partial) column;
+// rows are Sun..Sat top-to-bottom.
+fn render_heatmap(tree: &GitTree, area_width: u16) -> (String, Vec<Line<'static>>) {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let today_day = now_secs / 86_400;
+    // 1970-01-01 was a Thursday (=4 in Sun=0 scheme), so weekday = (day + 4) % 7.
+    let today_dow = ((today_day + 4).rem_euclid(7)) as i64;
 
-    let datasets = vec![
-        Dataset::default()
-            .name("CPU %")
-            .marker(symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Cyan))
-            .data(&data),
-    ];
+    // Reserve 4 chars for the weekday label column ("Mon ") and 2 for borders.
+    // Each week column renders as 2 chars wide ("■ ") to keep cells from
+    // looking stretched and to land on ~6 months across the panel.
+    let inner = area_width.saturating_sub(2) as usize;
+    let weeks = inner.saturating_sub(4) / 2;
+    let weeks = weeks.min(HEATMAP_WEEKS_MAX);
 
-    let title = format!(
-        " CPU usage — {:.1}% (4s avg, last 5 min) ",
-        app.cpu_callout
-    );
-    let chart = Chart::new(datasets)
-        .style(Style::reset())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .style(Style::reset())
-                .title(title),
-        )
-        .x_axis(
-            Axis::default()
-                .style(Style::default().fg(Color::DarkGray))
-                .bounds([-(HISTORY_WINDOW_SECS as f64), 0.0])
-                .labels(vec!["-5m", "-2.5m", "now"]),
-        )
-        .y_axis(
-            Axis::default()
-                .style(Style::default().fg(Color::DarkGray))
-                .bounds([0.0, 100.0])
-                .labels(vec!["0%", "50%", "100%"]),
-        );
+    // grid[row][col] — None for cells outside the year window (e.g. days
+    // after today in the current week).
+    let mut grid: Vec<Vec<Option<u32>>> = vec![vec![None; weeks]; 7];
+    let mut total: u32 = 0;
+    for col in 0..weeks {
+        let weeks_ago = (weeks - 1 - col) as i64;
+        for row in 0..7i64 {
+            let day = today_day - weeks_ago * 7 - (today_dow - row);
+            if day > today_day {
+                continue;
+            }
+            let count = tree.commit_days.get(&day).copied().unwrap_or(0);
+            grid[row as usize][col] = Some(count);
+            total += count;
+        }
+    }
 
-    f.render_widget(chart, area);
+    let max_count = grid
+        .iter()
+        .flatten()
+        .filter_map(|c| *c)
+        .max()
+        .unwrap_or(0);
+
+    let day_labels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(8);
+    lines.push(month_label_row(weeks, today_day, today_dow));
+    for row in 0..7 {
+        // Show only Mon/Wed/Fri labels to mirror GitHub's compact layout.
+        let label = if matches!(row, 1 | 3 | 5) {
+            format!("{:>3} ", day_labels[row])
+        } else {
+            "    ".to_string()
+        };
+        let mut spans: Vec<Span<'static>> = vec![Span::styled(
+            label,
+            Style::default().fg(Color::DarkGray),
+        )];
+        for col in 0..weeks {
+            spans.push(match grid[row][col] {
+                Some(count) => Span::styled(
+                    "■",
+                    Style::default().fg(heatmap_color(count, max_count)),
+                ),
+                None => Span::raw(" "),
+            });
+            spans.push(Span::raw(" "));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let title = format!(" Commits — {total} in the past year ");
+    (title, lines)
 }
 
-fn draw_network_chart(f: &mut Frame, app: &App, area: Rect) {
-    let rx_data = history_to_points(&app.net_rx_history);
-    let tx_data = history_to_points(&app.net_tx_history);
+const MONTH_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
-    // Auto-scale y-axis to the largest value in the window, with a floor so
-    // the chart doesn't look jumpy when traffic is near zero.
-    let peak = app
-        .net_rx_history
-        .iter()
-        .chain(app.net_tx_history.iter())
-        .copied()
-        .fold(0.0_f64, f64::max);
-    let ymax = (peak * 1.2).max(NET_YMAX_FLOOR_MBPS);
-
-    let datasets = vec![
-        Dataset::default()
-            .name("↓ rx")
-            .marker(symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Green))
-            .data(&rx_data),
-        Dataset::default()
-            .name("↑ tx")
-            .marker(symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Magenta))
-            .data(&tx_data),
-    ];
-
-    let title = format!(
-        " Network — ↓ {:.1} Mbps  ↑ {:.1} Mbps  (10s avg) ",
-        app.net_rx_callout, app.net_tx_callout
-    );
-    let y_labels: Vec<String> = vec![
-        "0".to_string(),
-        format!("{:.0}", ymax / 2.0),
-        format!("{:.0}", ymax),
-    ];
-
-    let chart = Chart::new(datasets)
-        .style(Style::reset())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .style(Style::reset())
-                .title(title),
-        )
-        .x_axis(
-            Axis::default()
-                .style(Style::default().fg(Color::DarkGray))
-                .bounds([-(HISTORY_WINDOW_SECS as f64), 0.0])
-                .labels(vec!["-5m", "-2.5m", "now"]),
-        )
-        .y_axis(
-            Axis::default()
-                .style(Style::default().fg(Color::DarkGray))
-                .bounds([0.0, ymax])
-                .labels(y_labels),
-        );
-
-    f.render_widget(chart, area);
+// Place a 3-char month label above the column where that month's first
+// Sunday falls in the visible window. `next_free` guards against overlap.
+fn month_label_row(weeks: usize, today_day: i64, today_dow: i64) -> Line<'static> {
+    // Cell area is `weeks * 2` chars wide (each week renders as "■ ").
+    let width = weeks * 2;
+    let mut chars: Vec<char> = vec![' '; width];
+    let mut prev_month: u32 = 0;
+    let mut next_free: usize = 0;
+    for col in 0..weeks {
+        let weeks_ago = (weeks - 1 - col) as i64;
+        let sunday = today_day - weeks_ago * 7 - today_dow;
+        let (_, month, _) = civil_from_days(sunday);
+        let pos = col * 2;
+        if month != prev_month && pos >= next_free {
+            let label = MONTH_NAMES[month as usize - 1];
+            for (i, ch) in label.chars().enumerate() {
+                if pos + i < width {
+                    chars[pos + i] = ch;
+                }
+            }
+            next_free = pos + label.len() + 1;
+        }
+        prev_month = month;
+    }
+    let s: String = chars.into_iter().collect();
+    Line::from(vec![
+        Span::raw("    "),
+        Span::styled(s, Style::default().fg(Color::DarkGray)),
+    ])
 }
 
-fn draw_process_table(f: &mut Frame, app: &App, area: Rect) {
-    let header = Row::new(vec!["NAME", "CPU %", "MEMORY"]).style(Style::reset());
+// Howard Hinnant's civil_from_days. Days are signed from 1970-01-01.
+// Returns (year, month [1..=12], day [1..=31]).
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u32, d as u32)
+}
 
-    let rows: Vec<Row> = app
-        .processes
-        .iter()
-        .map(|p| {
-            Row::new(vec![
-                Cell::from(p.name.clone()),
-                Cell::from(format!("{:.1}%", p.cpu)),
-                Cell::from(format_bytes(p.memory_bytes)),
-            ])
-            .style(Style::reset())
-        })
-        .collect();
+fn heatmap_color(count: u32, max: u32) -> Color {
+    if count == 0 || max == 0 {
+        return Color::Rgb(40, 44, 52);
+    }
+    let frac = count as f64 / max as f64;
+    if frac > 0.66 {
+        Color::Rgb(57, 211, 83)
+    } else if frac > 0.33 {
+        Color::Rgb(38, 166, 65)
+    } else if frac > 0.10 {
+        Color::Rgb(0, 109, 50)
+    } else {
+        Color::Rgb(14, 68, 41)
+    }
+}
 
-    let widths = [
-        Constraint::Min(20),
-        Constraint::Length(8),
-        Constraint::Length(12),
-    ];
+fn draw_commits(f: &mut Frame, app: &App, area: Rect) {
+    let base_block = Block::default()
+        .borders(Borders::ALL)
+        .style(Style::reset());
 
-    let table = Table::new(rows, widths)
-        .header(header)
+    let (title, lines): (String, Vec<Line<'static>>) = match &app.git_tree {
+        Some(tree) => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let lines = tree
+                .commits
+                .iter()
+                .map(|c| {
+                    let age = format_age_short(now.saturating_sub(c.timestamp));
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{:>5}  ", age),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            format!("{:<14}", truncate(&c.repo, 14)),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::raw("  "),
+                        Span::raw(c.subject.clone()),
+                    ])
+                })
+                .collect();
+            let title = format!(
+                " My commits — {} across {} repos  (q to quit) ",
+                tree.commits.len(),
+                tree.total_repos,
+            );
+            (title, lines)
+        }
+        None => (
+            " My commits  (q to quit) ".to_string(),
+            vec![Line::from(Span::styled(
+                "scanning …",
+                Style::default().fg(Color::DarkGray),
+            ))],
+        ),
+    };
+
+    let para = Paragraph::new(lines)
         .style(Style::reset())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .style(Style::reset())
-                .title(" Top 10 by CPU  (q to quit) "),
-        );
-
-    f.render_widget(table, area);
+        .block(base_block.title(title));
+    f.render_widget(para, area);
 }
 
 fn draw_right_pane(f: &mut Frame, app: &App, area: Rect) {
@@ -638,6 +532,16 @@ fn format_age(secs: u64) -> String {
     }
 }
 
+fn format_age_short(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s if s < 2_592_000 => format!("{}d", s / 86_400),
+        s => format!("{}mo", s / 2_592_000),
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -647,17 +551,3 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.0} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.0} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}
