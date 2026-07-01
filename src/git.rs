@@ -9,22 +9,38 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const SUBPATH: &str = "Documents/code";
 const MAX_REPOS: usize = 30;
 const MAX_BRANCHES_PER_REPO: usize = 8;
-const MAX_COMMITS: usize = 200;
 const HEATMAP_LOOKBACK_DAYS: u32 = 400;
+const GRAPH_MAX_ROWS: usize = 200;
+const MAX_RECENT_COMMITS: usize = 200;
 
 pub struct GitTree {
     pub root_display: String,
     pub total_repos: usize,
     pub repos: Vec<RepoSummary>,
-    pub commits: Vec<CommitEntry>,
+    // Flat list of the author's recent commits across every repo, newest first.
+    // Drives the "overall" view shown when no repo is selected.
+    pub recent_commits: Vec<RecentCommit>,
+    // Aggregate per-day commit count across all repos, for the overall heatmap.
     pub commit_days: HashMap<i64, u32>,
     pub scanned_at: Instant,
 }
 
-pub struct CommitEntry {
+pub struct RecentCommit {
     pub repo: String,
     pub timestamp: u64,
     pub subject: String,
+}
+
+// One row of the commit graph for a single repo.
+// `prefix` is the raw graph drawing from `git log --graph` (`* | \ /` etc).
+// If `sha` is None, this is a "connector" row with no commit on it.
+pub struct GraphRow {
+    pub prefix: String,
+    pub sha: Option<String>,
+    pub timestamp: Option<u64>,
+    pub author: String,
+    pub subject: String,
+    pub refs: Vec<String>,
 }
 
 pub struct RepoSummary {
@@ -34,6 +50,8 @@ pub struct RepoSummary {
     pub is_dirty: bool,
     pub upstream_remote: Option<String>,
     pub fork_drift: Option<ForkDrift>,
+    // Per-day commit count for the heatmap window. Keys are days-since-epoch.
+    pub commit_days: HashMap<i64, u32>,
 }
 
 pub struct ForkDrift {
@@ -71,6 +89,10 @@ fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
+pub fn repo_dir(name: &str) -> Option<PathBuf> {
+    Some(home()?.join(SUBPATH).join(name))
+}
+
 fn scan() -> Option<GitTree> {
     let root = home()?.join(SUBPATH);
     if !root.is_dir() {
@@ -85,30 +107,28 @@ fn scan() -> Option<GitTree> {
         .collect();
 
     let author = user_email();
-    let mut commits: Vec<CommitEntry> = Vec::new();
-    let mut commit_days: HashMap<i64, u32> = HashMap::new();
+    let mut recent_commits: Vec<RecentCommit> = Vec::new();
+    let mut agg_days: HashMap<i64, u32> = HashMap::new();
+    let mut repos: Vec<RepoSummary> = Vec::new();
     for path in &repo_paths {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        for (timestamp, subject) in commits_in_window(path, author.as_deref()) {
-            let day = (timestamp as i64) / 86_400;
-            *commit_days.entry(day).or_insert(0) += 1;
-            commits.push(CommitEntry {
-                repo: name.clone(),
-                timestamp,
+        let Some((summary, commits)) = summarize_repo(path, author.as_deref()) else {
+            continue;
+        };
+        for (day, count) in &summary.commit_days {
+            *agg_days.entry(*day).or_insert(0) += count;
+        }
+        for (ts, subject) in commits {
+            recent_commits.push(RecentCommit {
+                repo: summary.name.clone(),
+                timestamp: ts,
                 subject,
             });
         }
+        repos.push(summary);
     }
-    commits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-    commits.truncate(MAX_COMMITS);
 
-    let mut repos: Vec<RepoSummary> = repo_paths
-        .iter()
-        .filter_map(|p| summarize_repo(p))
-        .collect();
+    recent_commits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    recent_commits.truncate(MAX_RECENT_COMMITS);
 
     repos.sort_by(|a, b| b.most_recent_commit.cmp(&a.most_recent_commit));
     let total_repos = repos.len();
@@ -118,8 +138,8 @@ fn scan() -> Option<GitTree> {
         root_display: format!("~/{SUBPATH}"),
         total_repos,
         repos,
-        commits,
-        commit_days,
+        recent_commits,
+        commit_days: agg_days,
         scanned_at: Instant::now(),
     })
 }
@@ -166,7 +186,10 @@ fn commits_in_window(path: &Path, author: Option<&str>) -> Vec<(u64, String)> {
         .collect()
 }
 
-fn summarize_repo(path: &Path) -> Option<RepoSummary> {
+fn summarize_repo(
+    path: &Path,
+    author: Option<&str>,
+) -> Option<(RepoSummary, Vec<(u64, String)>)> {
     let name = path.file_name()?.to_string_lossy().into_owned();
     let current = git_current_branch(path);
     let mut branches = git_branches(path);
@@ -182,15 +205,25 @@ fn summarize_repo(path: &Path) -> Option<RepoSummary> {
     } else {
         None
     };
+
+    let commits = commits_in_window(path, author);
+    let mut commit_days: HashMap<i64, u32> = HashMap::new();
+    for (timestamp, _subject) in &commits {
+        let day = (*timestamp as i64) / 86_400;
+        *commit_days.entry(day).or_insert(0) += 1;
+    }
+
     branches.truncate(MAX_BRANCHES_PER_REPO);
-    Some(RepoSummary {
+    let summary = RepoSummary {
         name,
         most_recent_commit,
         branches,
         is_dirty,
         upstream_remote,
         fork_drift,
-    })
+        commit_days,
+    };
+    Some((summary, commits))
 }
 
 fn git_upstream_remote_url(path: &Path) -> Option<String> {
@@ -370,6 +403,69 @@ fn parse_track(s: &str) -> (usize, usize) {
         }
     }
     (ahead, behind)
+}
+
+// Fetch a graph view for a single repo. Runs synchronously — callers should
+// cache and only invoke when the selection changes.
+pub fn graph(repo_dir: &Path) -> Vec<GraphRow> {
+    // `\x1f` (unit separator) is used between fields so subjects / refs can
+    // contain anything printable without breaking parsing.
+    let out = match Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args([
+            "log",
+            "--all",
+            "--graph",
+            "--date-order",
+            "--decorate=short",
+            "--format=%x00%H%x1f%ct%x1f%an%x1f%s%x1f%D",
+            &format!("-n{GRAPH_MAX_ROWS}"),
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().map(parse_graph_line).collect()
+}
+
+fn parse_graph_line(line: &str) -> GraphRow {
+    // Lines without a NUL marker are pure graph connectors (`|\`, `|/`, etc).
+    let Some((prefix, payload)) = line.split_once('\x00') else {
+        return GraphRow {
+            prefix: line.to_string(),
+            sha: None,
+            timestamp: None,
+            author: String::new(),
+            subject: String::new(),
+            refs: Vec::new(),
+        };
+    };
+
+    let mut parts = payload.split('\x1f');
+    let sha = parts.next().unwrap_or("").to_string();
+    let ts: Option<u64> = parts.next().and_then(|s| s.parse().ok());
+    let author = parts.next().unwrap_or("").to_string();
+    let subject = parts.next().unwrap_or("").to_string();
+    let refs_raw = parts.next().unwrap_or("");
+
+    let refs: Vec<String> = refs_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    GraphRow {
+        prefix: prefix.to_string(),
+        sha: Some(sha),
+        timestamp: ts,
+        author,
+        subject,
+        refs,
+    }
 }
 
 fn git_is_dirty(path: &Path) -> bool {

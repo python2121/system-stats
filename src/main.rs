@@ -1,5 +1,7 @@
 mod git;
 
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,7 +14,13 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-use git::{GitTree, spawn_scanner};
+use git::{GitTree, GraphRow, RecentCommit, spawn_scanner};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Left,
+    Right,
+}
 
 const EVENT_POLL: Duration = Duration::from_millis(250);
 const HEATMAP_WEEKS_MAX: usize = 27;
@@ -20,6 +28,21 @@ const HEATMAP_WEEKS_MAX: usize = 27;
 struct App {
     git_rx: Receiver<GitTree>,
     git_tree: Option<GitTree>,
+    // None = overall "my activity" view. Some(i) = drilled into a specific repo.
+    // Esc returns to None; the first arrow press from None enters Some(0).
+    selected_repo: Option<usize>,
+    // Cached commit graphs keyed by repo name. Cleared when a new scan arrives
+    // so a deleted/added repo can't show stale lines.
+    graph_cache: HashMap<String, Vec<GraphRow>>,
+    // Which pane responds to Up/Down. Left/Right arrows swap this.
+    focus: Focus,
+    // Scroll offset (in lines) for the graph pane on the left. Reset when the
+    // selection changes so a new pane starts at the top.
+    left_scroll: u16,
+    // Content length and visible height of the graph pane, cached during draw
+    // so that scroll input can clamp against the actual rendered size.
+    left_content_lines: Cell<u16>,
+    left_inner_height: Cell<u16>,
     should_quit: bool,
 }
 
@@ -28,22 +51,100 @@ impl App {
         Self {
             git_rx: spawn_scanner(),
             git_tree: None,
+            selected_repo: None,
+            graph_cache: HashMap::new(),
+            focus: Focus::Right,
+            left_scroll: 0,
+            left_content_lines: Cell::new(0),
+            left_inner_height: Cell::new(0),
             should_quit: false,
         }
     }
 
     fn drain_git_updates(&mut self) {
+        let mut got_new = false;
         while let Ok(tree) = self.git_rx.try_recv() {
             self.git_tree = Some(tree);
+            got_new = true;
         }
+        if got_new {
+            self.graph_cache.clear();
+            self.clamp_selection();
+            self.left_scroll = 0;
+        }
+    }
+
+    fn clamp_selection(&mut self) {
+        let n = self.git_tree.as_ref().map(|t| t.repos.len()).unwrap_or(0);
+        match self.selected_repo {
+            Some(_) if n == 0 => self.selected_repo = None,
+            Some(i) if i >= n => self.selected_repo = Some(n - 1),
+            _ => {}
+        }
+    }
+
+    fn move_selection(&mut self, delta: i32) {
+        let Some(tree) = &self.git_tree else { return };
+        let n = tree.repos.len();
+        if n == 0 {
+            return;
+        }
+        let next = match self.selected_repo {
+            // First arrow press from the overall view drops us into the
+            // top-most repo regardless of direction.
+            None => 0,
+            Some(i) => (i as i32 + delta).clamp(0, n as i32 - 1) as usize,
+        };
+        if self.selected_repo != Some(next) {
+            self.left_scroll = 0;
+        }
+        self.selected_repo = Some(next);
+    }
+
+    fn scroll_left_pane(&mut self, delta: i32) {
+        let max = self
+            .left_content_lines
+            .get()
+            .saturating_sub(self.left_inner_height.get());
+        let next = (self.left_scroll as i32 + delta).clamp(0, max as i32);
+        self.left_scroll = next as u16;
+    }
+
+    // Lazily fetch + cache the commit graph for the selected repo so we only
+    // shell out to git when the user actually navigates to it.
+    fn ensure_graph_loaded(&mut self) {
+        let Some(tree) = &self.git_tree else { return };
+        let Some(idx) = self.selected_repo else { return };
+        let Some(repo) = tree.repos.get(idx) else { return };
+        if self.graph_cache.contains_key(&repo.name) {
+            return;
+        }
+        let Some(path) = git::repo_dir(&repo.name) else { return };
+        let rows = git::graph(&path);
+        self.graph_cache.insert(repo.name.clone(), rows);
     }
 
     fn handle_events(&mut self) -> std::io::Result<()> {
         if event::poll(EVENT_POLL)? {
             if let Event::Key(key) = event::read()? {
                 match (key.code, key.modifiers) {
-                    (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => self.should_quit = true,
+                    (KeyCode::Char('q'), _) => self.should_quit = true,
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
+                    (KeyCode::Esc, _) => {
+                        self.selected_repo = None;
+                        self.focus = Focus::Right;
+                        self.left_scroll = 0;
+                    }
+                    (KeyCode::Left, _) | (KeyCode::Char('h'), _) => self.focus = Focus::Left,
+                    (KeyCode::Right, _) | (KeyCode::Char('l'), _) => self.focus = Focus::Right,
+                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) => match self.focus {
+                        Focus::Right => self.move_selection(-1),
+                        Focus::Left => self.scroll_left_pane(-1),
+                    },
+                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) => match self.focus {
+                        Focus::Right => self.move_selection(1),
+                        Focus::Left => self.scroll_left_pane(1),
+                    },
                     _ => {}
                 }
             }
@@ -63,6 +164,7 @@ fn main() -> std::io::Result<()> {
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     while !app.should_quit {
         app.drain_git_updates();
+        app.ensure_graph_loaded();
         terminal.draw(|f| draw(f, app))?;
         app.handle_events()?;
     }
@@ -72,7 +174,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
 fn draw(f: &mut Frame, app: &App) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(f.area());
 
     let left = Layout::default()
@@ -81,7 +183,7 @@ fn draw(f: &mut Frame, app: &App) {
         .split(columns[0]);
 
     draw_heatmap(f, app, left[0]);
-    draw_commits(f, app, left[1]);
+    draw_graph(f, app, left[1]);
     draw_right_pane(f, app, columns[1]);
 }
 
@@ -91,7 +193,13 @@ fn draw_heatmap(f: &mut Frame, app: &App, area: Rect) {
         .style(Style::reset());
 
     let (title, lines) = match &app.git_tree {
-        Some(tree) => render_heatmap(tree, area.width),
+        Some(tree) => {
+            let (label, days) = match app.selected_repo.and_then(|i| tree.repos.get(i)) {
+                Some(repo) => (repo.name.as_str(), &repo.commit_days),
+                None => ("all repos", &tree.commit_days),
+            };
+            render_heatmap(label, days, area.width)
+        }
         None => (
             " Commits ".to_string(),
             vec![Line::from(Span::styled(
@@ -107,9 +215,13 @@ fn draw_heatmap(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, area);
 }
 
-// Build the 7×N heatmap. Today is in the rightmost (possibly partial) column;
-// rows are Sun..Sat top-to-bottom.
-fn render_heatmap(tree: &GitTree, area_width: u16) -> (String, Vec<Line<'static>>) {
+// Build the 7×N heatmap from a per-day commit count map. Today is in the
+// rightmost (possibly partial) column; rows are Sun..Sat top-to-bottom.
+fn render_heatmap(
+    label: &str,
+    commit_days: &HashMap<i64, u32>,
+    area_width: u16,
+) -> (String, Vec<Line<'static>>) {
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -136,7 +248,7 @@ fn render_heatmap(tree: &GitTree, area_width: u16) -> (String, Vec<Line<'static>
             if day > today_day {
                 continue;
             }
-            let count = tree.commit_days.get(&day).copied().unwrap_or(0);
+            let count = commit_days.get(&day).copied().unwrap_or(0);
             grid[row as usize][col] = Some(count);
             total += count;
         }
@@ -211,7 +323,7 @@ fn render_heatmap(tree: &GitTree, area_width: u16) -> (String, Vec<Line<'static>
         lines.push(Line::from(spans));
     }
 
-    let title = format!(" Commits — {total} in the past year ");
+    let title = format!(" Commits — {label} · {total} in view ");
     (title, lines)
 }
 
@@ -294,45 +406,49 @@ fn heatmap_color(count: u32, max: u32) -> Color {
     }
 }
 
-fn draw_commits(f: &mut Frame, app: &App, area: Rect) {
+fn draw_graph(f: &mut Frame, app: &App, area: Rect) {
+    let focused = app.focus == Focus::Left;
     let base_block = Block::default()
         .borders(Borders::ALL)
+        .border_style(if focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::reset()
+        })
         .style(Style::reset());
 
-    let (title, lines): (String, Vec<Line<'static>>) = match &app.git_tree {
-        Some(tree) => {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let lines = tree
-                .commits
-                .iter()
-                .map(|c| {
-                    let age = format_age_short(now.saturating_sub(c.timestamp));
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{:>5}  ", age),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::styled(
-                            format!("{:<14}", truncate(&c.repo, 14)),
-                            Style::default().fg(Color::Cyan),
-                        ),
-                        Span::raw("  "),
-                        Span::raw(c.subject.clone()),
-                    ])
-                })
-                .collect();
-            let title = format!(
-                " My commits — {} across {} repos  (q to quit) ",
-                tree.commits.len(),
-                tree.total_repos,
-            );
+    let (title, lines): (String, Vec<Line<'static>>) = match (&app.git_tree, app.selected_repo) {
+        (Some(tree), Some(idx)) if idx < tree.repos.len() => {
+            let repo = &tree.repos[idx];
+            let hint = if focused { " (↑/↓ scroll · Esc back) " } else { " (Esc back) " };
+            let title = format!(" Graph — {}  {hint}", repo.name);
+            let lines = match app.graph_cache.get(&repo.name) {
+                Some(rows) => render_graph(rows),
+                None => vec![Line::from(Span::styled(
+                    "loading …",
+                    Style::default().fg(Color::DarkGray),
+                ))],
+            };
             (title, lines)
         }
-        None => (
-            " My commits  (q to quit) ".to_string(),
+        (Some(tree), _) => {
+            let hint = if focused { " (↑/↓ scroll) " } else { " " };
+            let title = format!(
+                " Recent commits — {} latest {hint}",
+                tree.recent_commits.len(),
+            );
+            let lines = if tree.recent_commits.is_empty() {
+                vec![Line::from(Span::styled(
+                    "no commits found",
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            } else {
+                render_recent_commits(&tree.recent_commits)
+            };
+            (title, lines)
+        }
+        (None, _) => (
+            " Recent commits ".to_string(),
             vec![Line::from(Span::styled(
                 "scanning …",
                 Style::default().fg(Color::DarkGray),
@@ -340,26 +456,173 @@ fn draw_commits(f: &mut Frame, app: &App, area: Rect) {
         ),
     };
 
+    // Cache the rendered size so Up/Down can clamp its scroll on the next tick.
+    app.left_content_lines.set(lines.len() as u16);
+    app.left_inner_height.set(area.height.saturating_sub(2));
+
     let para = Paragraph::new(lines)
         .style(Style::reset())
+        .scroll((app.left_scroll, 0))
         .block(base_block.title(title));
     f.render_widget(para, area);
 }
 
+fn render_recent_commits(commits: &[RecentCommit]) -> Vec<Line<'static>> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Pad repo names to the widest in view so subjects line up in a column.
+    let repo_w = commits
+        .iter()
+        .map(|c| c.repo.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(24);
+
+    commits
+        .iter()
+        .map(|c| {
+            let age = format_age_short(now.saturating_sub(c.timestamp));
+            let repo = truncate(&c.repo, repo_w);
+            let pad = repo_w.saturating_sub(repo.chars().count());
+            Line::from(vec![
+                Span::styled(
+                    format!("{age:>4}  "),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(repo, Style::default().fg(Color::Cyan)),
+                Span::raw(" ".repeat(pad + 2)),
+                Span::raw(truncate(&c.subject, 80)),
+            ])
+        })
+        .collect()
+}
+
+// Color the graph drawing column-by-column so each lane reads as a distinct
+// color. This is an approximation — git's lanes can shift columns at merges
+// and branches — but it's cheap and visually close to a true swim-lane view.
+const LANE_COLORS: [Color; 6] = [
+    Color::Rgb(57, 211, 83),   // green
+    Color::Rgb(217, 80, 188),  // magenta
+    Color::Rgb(99, 167, 255),  // blue
+    Color::Rgb(252, 199, 75),  // amber
+    Color::Rgb(255, 110, 110), // coral
+    Color::Rgb(120, 219, 226), // cyan
+];
+
+fn lane_color(col: usize) -> Color {
+    LANE_COLORS[(col / 2) % LANE_COLORS.len()]
+}
+
+fn render_graph(rows: &[GraphRow]) -> Vec<Line<'static>> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    rows.iter()
+        .map(|row| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            // Graph drawing chars, colored by column.
+            for (i, ch) in row.prefix.chars().enumerate() {
+                if ch == ' ' {
+                    spans.push(Span::raw(" "));
+                } else {
+                    spans.push(Span::styled(
+                        ch.to_string(),
+                        Style::default().fg(lane_color(i)),
+                    ));
+                }
+            }
+
+            // Connector-only rows (no commit on them) stop here.
+            if row.sha.is_none() {
+                return Line::from(spans);
+            }
+
+            // Refs as colored chips, à la the screenshot.
+            for r in &row.refs {
+                spans.push(Span::raw(" "));
+                spans.push(ref_chip(r));
+            }
+
+            spans.push(Span::raw(" "));
+            spans.push(Span::raw(row.subject.clone()));
+
+            let age = row
+                .timestamp
+                .map(|t| format_age_short(now.saturating_sub(t)))
+                .unwrap_or_default();
+            spans.push(Span::styled(
+                format!("  {age}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+            if !row.author.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {}", row.author),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn ref_chip(r: &str) -> Span<'static> {
+    let (label, style) = if let Some(target) = r.strip_prefix("HEAD -> ") {
+        (
+            format!(" HEAD→{target} "),
+            Style::default().bg(Color::Cyan).fg(Color::Black),
+        )
+    } else if r == "HEAD" {
+        (
+            " HEAD ".to_string(),
+            Style::default().bg(Color::Cyan).fg(Color::Black),
+        )
+    } else if let Some(tag) = r.strip_prefix("tag: ") {
+        (
+            format!(" {tag} "),
+            Style::default().bg(Color::Yellow).fg(Color::Black),
+        )
+    } else if r.contains('/') {
+        // Remote-tracking branch — softer color so HEAD/tags stand out.
+        (
+            format!(" {r} "),
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+        )
+    } else {
+        (
+            format!(" {r} "),
+            Style::default().bg(Color::Magenta).fg(Color::Black),
+        )
+    };
+    Span::styled(label, style)
+}
+
 fn draw_right_pane(f: &mut Frame, app: &App, area: Rect) {
+    let focused = app.focus == Focus::Right;
     let base_block = Block::default()
         .borders(Borders::ALL)
+        .border_style(if focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::reset()
+        })
         .style(Style::reset());
 
     match &app.git_tree {
         Some(tree) => {
             // Round to 5-second increments so the title doesn't flicker every tick.
             let rounded = (tree.scanned_at.elapsed().as_secs() / 5) * 5;
+            let hint = if focused { " (↑/↓ select) " } else { " " };
             let title = format!(
-                " Git activity — {} repos in {}  (scanned {}s ago) ",
+                " Git activity — {} repos in {}  (scanned {}s ago){hint}",
                 tree.total_repos, tree.root_display, rounded,
             );
-            let lines = render_git_tree(tree);
+            let lines = render_git_tree(tree, app.selected_repo);
             let para = Paragraph::new(lines)
                 .style(Style::reset())
                 .block(base_block.title(title));
@@ -457,14 +720,15 @@ fn pick_trunk_idx(branches: &[git::BranchInfo]) -> Option<usize> {
     None
 }
 
-fn render_git_tree(tree: &GitTree) -> Vec<Line<'static>> {
+fn render_git_tree(tree: &GitTree, selected: Option<usize>) -> Vec<Line<'static>> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let mut lines: Vec<Line> = Vec::new();
 
-    for repo in &tree.repos {
+    for (idx, repo) in tree.repos.iter().enumerate() {
+        let is_selected = selected == Some(idx);
         let age_secs = repo.most_recent_commit.map(|t| now.saturating_sub(t));
         let age_str = age_secs
             .map(format_age)
@@ -476,14 +740,26 @@ fn render_git_tree(tree: &GitTree) -> Vec<Line<'static>> {
         };
 
         // Repo header — name, age, and (if applicable) the upstream pointer
-        // all on one line.
+        // all on one line. Selected repo gets a bright arrow + bold name.
+        let marker = if is_selected { "▶" } else { " " };
+        let marker_style = if is_selected {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        let name_style = if is_selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
         let mut header_spans = vec![
+            Span::styled(marker.to_string(), marker_style),
+            Span::raw(" "),
             Span::styled(bullet.to_string(), Style::default().fg(bullet_color)),
             Span::raw(" "),
-            Span::styled(
-                repo.name.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(repo.name.clone(), name_style),
             Span::styled(
                 format!("   {age_str}"),
                 Style::default().fg(Color::DarkGray),
@@ -557,10 +833,11 @@ fn render_git_tree(tree: &GitTree) -> Vec<Line<'static>> {
             }
         }
 
-        // Top-level indent of 2 spaces.
+        // Indent 4 so the tree lines up under the repo name (the leading
+        // "▶ ● " on the header is 4 cells).
         let last_idx = rows.len().saturating_sub(1);
         for (i, row) in rows.into_iter().enumerate() {
-            render_tree_row(row, "  ", i == last_idx, &mut lines);
+            render_tree_row(row, "    ", i == last_idx, &mut lines);
         }
 
         lines.push(Line::from(""));
