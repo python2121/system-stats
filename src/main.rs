@@ -1,20 +1,22 @@
+mod config;
 mod git;
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::mpsc::Receiver;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Tabs},
 };
 
-use git::{GitTree, GraphRow, RecentCommit, spawn_scanner};
+use config::Config;
+use git::{GitTree, GraphRow, RecentCommit, Scanner, spawn_scanner};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -40,26 +42,179 @@ impl Tab {
     }
 }
 
+// Menus are a stack: hitting Esc on the tab bar pushes `Main`; picking
+// Settings from Main pushes `Settings` on top; Esc pops one level. The
+// enum + selected-index combo keeps each level tiny while still letting
+// draw_menu / activate switch on the current level's identity.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum MenuItem {
+enum MenuKind {
+    Main,
+    Settings,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MainItem {
     Settings,
     Exit,
 }
 
-const MENU_ITEMS: [MenuItem; 2] = [MenuItem::Settings, MenuItem::Exit];
-const MENU_LABELS: [&str; 2] = ["Settings", "Exit"];
+const MAIN_ITEMS: [MainItem; 2] = [MainItem::Settings, MainItem::Exit];
+const MAIN_LABELS: [&str; 2] = ["Settings", "Exit"];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsItem {
+    WatchDir,
+}
+
+const SETTINGS_ITEMS: [SettingsItem; 1] = [SettingsItem::WatchDir];
+const SETTINGS_LABELS: [&str; 1] = ["Watch directory"];
 
 // Small modal shown when the user hits Esc on the tab bar. Owns its own
 // cursor so nav keys can drive it independently of the pane focus underneath.
 struct Menu {
+    kind: MenuKind,
     selected: usize,
+}
+
+impl Menu {
+    fn main() -> Self { Self { kind: MenuKind::Main, selected: 0 } }
+    fn settings() -> Self { Self { kind: MenuKind::Settings, selected: 0 } }
+
+    fn labels(&self) -> &'static [&'static str] {
+        match self.kind {
+            MenuKind::Main => &MAIN_LABELS,
+            MenuKind::Settings => &SETTINGS_LABELS,
+        }
+    }
+
+    fn title(&self) -> &'static str {
+        match self.kind {
+            MenuKind::Main => " Menu — Esc to close ",
+            MenuKind::Settings => " Settings — Esc back ",
+        }
+    }
+}
+
+// Modal for picking / changing the watched directory. Non-cancelable on
+// first launch (can_cancel = false) so we always end up with a config file
+// on disk; cancelable when opened from Settings so Esc is a real out.
+struct DirectoryPrompt {
+    input: String,
+    // Char position (not byte) — 0..=char_count. Kept unicode-safe so a
+    // path with multi-byte chars doesn't panic on Backspace.
+    cursor: usize,
+    error: Option<String>,
+    can_cancel: bool,
+}
+
+impl DirectoryPrompt {
+    fn new(current: &Path, can_cancel: bool) -> Self {
+        let input = config::display_path(current);
+        let cursor = input.chars().count();
+        Self { input, cursor, error: None, can_cancel }
+    }
+
+    fn char_count(&self) -> usize {
+        self.input.chars().count()
+    }
+
+    fn byte_at(&self, char_pos: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(char_pos)
+            .map(|(b, _)| b)
+            .unwrap_or(self.input.len())
+    }
+
+    fn insert(&mut self, ch: char) {
+        let i = self.byte_at(self.cursor);
+        self.input.insert(i, ch);
+        self.cursor += 1;
+        self.error = None;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor > 0 {
+            let end = self.byte_at(self.cursor);
+            let start = self.byte_at(self.cursor - 1);
+            self.input.replace_range(start..end, "");
+            self.cursor -= 1;
+            self.error = None;
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.cursor < self.char_count() {
+            let start = self.byte_at(self.cursor);
+            let end = self.byte_at(self.cursor + 1);
+            self.input.replace_range(start..end, "");
+            self.error = None;
+        }
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        if self.cursor < self.char_count() {
+            self.cursor += 1;
+        }
+    }
+
+    fn home(&mut self) { self.cursor = 0; }
+    fn end(&mut self) { self.cursor = self.char_count(); }
+
+    fn clear_line(&mut self) {
+        self.input.clear();
+        self.cursor = 0;
+        self.error = None;
+    }
+
+    // Ctrl-W: kill the whitespace-bounded word to the left of the cursor,
+    // eating any trailing whitespace first (so hitting Ctrl-W twice on
+    // "foo bar " nukes " " then "bar").
+    fn kill_word_back(&mut self) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut i = self.cursor;
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        if i < self.cursor {
+            let start = self.byte_at(i);
+            let end = self.byte_at(self.cursor);
+            self.input.replace_range(start..end, "");
+            self.cursor = i;
+            self.error = None;
+        }
+    }
+
+    // Convert the current input into an absolute PathBuf suitable for saving.
+    // Expands `~`, then anchors any leftover relative path to CWD so the
+    // saved setting doesn't depend on where the app was launched from.
+    fn resolved_path(&self) -> PathBuf {
+        let expanded = config::expand_tilde(self.input.trim());
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&expanded))
+                .unwrap_or(expanded)
+        }
+    }
 }
 
 const EVENT_POLL: Duration = Duration::from_millis(250);
 const HEATMAP_WEEKS_MAX: usize = 27;
 
 struct App {
-    git_rx: Receiver<GitTree>,
+    scanner: Scanner,
+    // Persisted settings (currently just watch_dir). Kept in-memory so that
+    // key handlers can compare and write without re-reading the file.
+    config: Config,
     git_tree: Option<GitTree>,
     // None = overall "my activity" view. Some(i) = drilled into a specific repo.
     // Esc returns to None; the first arrow press from None enters Some(0).
@@ -78,15 +233,33 @@ struct App {
     // so that scroll input can clamp against the actual rendered size.
     left_content_lines: Cell<u16>,
     left_inner_height: Cell<u16>,
-    // When Some, an overlay menu is open and swallows all input until Esc.
-    menu: Option<Menu>,
+    // Modal menu stack. Empty when no menu is showing. Esc pops one level;
+    // picking an item can push another level (e.g. Main → Settings).
+    // Always renders the top-of-stack; lower levels are hidden behind it.
+    menu_stack: Vec<Menu>,
+    // When Some, the directory prompt is open and swallows all input. Sits
+    // above the menu stack — closing it drops the user back onto whichever
+    // menu was topmost, so Esc-out-of-prompt naturally returns to Settings.
+    dir_prompt: Option<DirectoryPrompt>,
     should_quit: bool,
 }
 
 impl App {
     fn new() -> Self {
+        let config = Config::load().unwrap_or_default();
+        // No config file on disk ⇒ first launch. Force a directory pick
+        // before the user can navigate anywhere else. The scanner still
+        // spins up on the (default) path so results appear immediately if
+        // the user just hits Enter to accept.
+        let dir_prompt = if !Config::exists() {
+            Some(DirectoryPrompt::new(&config.watch_dir, false))
+        } else {
+            None
+        };
+        let scanner = spawn_scanner(config.watch_dir.clone());
         Self {
-            git_rx: spawn_scanner(),
+            scanner,
+            config,
             git_tree: None,
             selected_repo: None,
             graph_cache: HashMap::new(),
@@ -95,14 +268,22 @@ impl App {
             left_scroll: 0,
             left_content_lines: Cell::new(0),
             left_inner_height: Cell::new(0),
-            menu: None,
+            menu_stack: Vec::new(),
+            dir_prompt,
             should_quit: false,
         }
     }
 
     fn drain_git_updates(&mut self) {
         let mut got_new = false;
-        while let Ok(tree) = self.git_rx.try_recv() {
+        while let Ok(tree) = self.scanner.try_recv() {
+            // Discard trees scanned from a stale root. Prevents a scan
+            // that was in flight when the user changed watch_dir from
+            // clobbering the "scanning …" state with results from the
+            // old directory.
+            if tree.root != self.config.watch_dir {
+                continue;
+            }
             self.git_tree = Some(tree);
             got_new = true;
         }
@@ -182,94 +363,220 @@ impl App {
         if self.graph_cache.contains_key(&repo.name) {
             return;
         }
-        let Some(path) = git::repo_dir(&repo.name) else { return };
-        let rows = git::graph(&path);
+        let rows = git::graph(&repo.path);
         self.graph_cache.insert(repo.name.clone(), rows);
     }
 
     fn menu_move(&mut self, delta: i32) {
-        if let Some(m) = &mut self.menu {
-            let n = MENU_ITEMS.len() as i32;
-            let next = (m.selected as i32 + delta).clamp(0, n - 1);
-            m.selected = next as usize;
-        }
+        let Some(top) = self.menu_stack.last_mut() else { return };
+        let n = top.labels().len() as i32;
+        if n == 0 { return; }
+        let next = (top.selected as i32 + delta).clamp(0, n - 1);
+        top.selected = next as usize;
     }
 
     fn menu_activate(&mut self) {
-        let Some(m) = &self.menu else { return };
-        match MENU_ITEMS[m.selected] {
-            MenuItem::Settings => {}
-            MenuItem::Exit => self.should_quit = true,
+        // Snapshot kind + selected so the borrow checker lets us push a
+        // new menu (also `&mut self`) inside the match arms.
+        let Some(top) = self.menu_stack.last() else { return };
+        let kind = top.kind;
+        let selected = top.selected;
+        match kind {
+            MenuKind::Main => match MAIN_ITEMS[selected] {
+                // Settings pushes rather than replaces: hitting Esc from
+                // Settings should return here, not close the menu entirely.
+                MainItem::Settings => self.menu_stack.push(Menu::settings()),
+                MainItem::Exit => self.should_quit = true,
+            },
+            MenuKind::Settings => match SETTINGS_ITEMS[selected] {
+                // Leave the Settings menu on the stack while the prompt is
+                // open, so Esc-out-of-prompt drops back onto Settings.
+                SettingsItem::WatchDir => {
+                    self.dir_prompt = Some(DirectoryPrompt::new(
+                        &self.config.watch_dir,
+                        true,
+                    ));
+                }
+            },
         }
     }
 
-    fn handle_events(&mut self) -> std::io::Result<()> {
-        if event::poll(EVENT_POLL)? {
-            if let Event::Key(key) = event::read()? {
-                // While the menu is open it swallows every key except Ctrl-C.
-                if self.menu.is_some() {
-                    match (key.code, key.modifiers) {
-                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
-                        (KeyCode::Esc, _) => self.menu = None,
-                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.menu_move(-1),
-                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.menu_move(1),
-                        (KeyCode::Enter, _) => self.menu_activate(),
-                        _ => {}
-                    }
-                    return Ok(());
+    // Commit the prompt: validate → write to disk → tell the scanner. If any
+    // step fails we leave the prompt open with an error message so the user
+    // can fix it in place.
+    fn submit_dir_prompt(&mut self) {
+        let Some(prompt) = self.dir_prompt.as_mut() else { return };
+        let resolved = prompt.resolved_path();
+        if !resolved.is_dir() {
+            prompt.error = Some(format!("not a directory: {}", resolved.display()));
+            return;
+        }
+        let same_path = resolved == self.config.watch_dir;
+        // On first launch we always write the file even if the user just
+        // accepted the default — otherwise the prompt would re-appear next
+        // start. On later runs we skip the write when nothing changed.
+        let needs_write = !Config::exists() || !same_path;
+        if needs_write {
+            let mut new_config = self.config.clone();
+            new_config.watch_dir = resolved.clone();
+            if let Err(e) = new_config.save() {
+                if let Some(p) = self.dir_prompt.as_mut() {
+                    p.error = Some(format!("failed to save config: {e}"));
                 }
+                return;
+            }
+            self.config = new_config;
+        }
+        // Only touch the scanner + repo state when the path actually moved.
+        // A no-op accept shouldn't churn a rescan.
+        if !same_path {
+            self.scanner.set_root(resolved);
+            self.git_tree = None;
+            self.graph_cache.clear();
+            self.selected_repo = None;
+            self.left_scroll = 0;
+            self.focus = Focus::Tabs;
+        }
+        self.dir_prompt = None;
+    }
 
-                match (key.code, key.modifiers) {
-                    (KeyCode::Char('q'), _) => self.should_quit = true,
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
-                    (KeyCode::Esc, _) => {
-                        if self.focus == Focus::Tabs {
-                            self.menu = Some(Menu { selected: 0 });
-                        } else {
-                            self.selected_repo = None;
-                            self.focus = Focus::Tabs;
-                            self.left_scroll = 0;
-                        }
-                    }
-                    (KeyCode::Left, _) | (KeyCode::Char('h'), _) => match self.focus {
-                        Focus::Tabs => self.cycle_tab(-1),
-                        Focus::Right | Focus::Left => self.focus = Focus::Left,
-                    },
-                    (KeyCode::Right, _) | (KeyCode::Char('l'), _) => match self.focus {
-                        Focus::Tabs => self.cycle_tab(1),
-                        Focus::Right | Focus::Left => self.focus = Focus::Right,
-                    },
-                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) => match self.focus {
-                        Focus::Tabs => {}
-                        Focus::Right => match self.selected_repo {
-                            // At the top of the list (or no cursor yet) → jump to tabs.
-                            None | Some(0) => {
-                                self.focus = Focus::Tabs;
-                                self.selected_repo = None;
-                            }
-                            Some(i) => {
-                                self.selected_repo = Some(i - 1);
-                                self.left_scroll = 0;
-                            }
-                        },
-                        Focus::Left => {
-                            if self.left_scroll == 0 {
-                                self.focus = Focus::Tabs;
-                            } else {
-                                self.scroll_left_pane(-1);
-                            }
-                        }
-                    },
-                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) => match self.focus {
-                        Focus::Tabs => self.enter_right_pane(),
-                        Focus::Right => self.move_selection(1),
-                        Focus::Left => self.scroll_left_pane(1),
-                    },
-                    _ => {}
+    fn handle_events(&mut self) -> std::io::Result<()> {
+        if !event::poll(EVENT_POLL)? {
+            return Ok(());
+        }
+        let Event::Key(key) = event::read()? else {
+            return Ok(());
+        };
+        // Modals take precedence over the tab/pane input. The prompt sits
+        // above the menu in priority so if we ever open both, the prompt
+        // wins.
+        if self.dir_prompt.is_some() {
+            self.handle_prompt_key(key);
+            return Ok(());
+        }
+        if !self.menu_stack.is_empty() {
+            self.handle_menu_key(key);
+            return Ok(());
+        }
+        self.handle_main_key(key);
+        Ok(())
+    }
+
+    fn handle_menu_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
+            // Esc pops one level — Settings → Main → app.
+            (KeyCode::Esc, _) => { self.menu_stack.pop(); }
+            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.menu_move(-1),
+            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.menu_move(1),
+            (KeyCode::Enter, _) => self.menu_activate(),
+            _ => {}
+        }
+    }
+
+    fn handle_prompt_key(&mut self, key: KeyEvent) {
+        // Snapshot cancelability up front so the borrow checker is happy
+        // when we later reach for `&mut self.dir_prompt` inside arms.
+        let can_cancel = self
+            .dir_prompt
+            .as_ref()
+            .map(|p| p.can_cancel)
+            .unwrap_or(false);
+        let ctrl = KeyModifiers::CONTROL;
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), m) if m == ctrl => self.should_quit = true,
+            (KeyCode::Esc, _) if can_cancel => self.dir_prompt = None,
+            (KeyCode::Enter, _) => self.submit_dir_prompt(),
+            (KeyCode::Backspace, _) => {
+                if let Some(p) = self.dir_prompt.as_mut() { p.backspace(); }
+            }
+            (KeyCode::Delete, _) => {
+                if let Some(p) = self.dir_prompt.as_mut() { p.delete(); }
+            }
+            (KeyCode::Left, _) => {
+                if let Some(p) = self.dir_prompt.as_mut() { p.move_left(); }
+            }
+            (KeyCode::Right, _) => {
+                if let Some(p) = self.dir_prompt.as_mut() { p.move_right(); }
+            }
+            (KeyCode::Home, _) => {
+                if let Some(p) = self.dir_prompt.as_mut() { p.home(); }
+            }
+            (KeyCode::End, _) => {
+                if let Some(p) = self.dir_prompt.as_mut() { p.end(); }
+            }
+            // Readline-style bindings — expected reflexes for anyone who's
+            // used bash/zsh/emacs. Ctrl-C is handled above and takes priority.
+            (KeyCode::Char('a'), m) if m == ctrl => {
+                if let Some(p) = self.dir_prompt.as_mut() { p.home(); }
+            }
+            (KeyCode::Char('e'), m) if m == ctrl => {
+                if let Some(p) = self.dir_prompt.as_mut() { p.end(); }
+            }
+            (KeyCode::Char('u'), m) if m == ctrl => {
+                if let Some(p) = self.dir_prompt.as_mut() { p.clear_line(); }
+            }
+            (KeyCode::Char('w'), m) if m == ctrl => {
+                if let Some(p) = self.dir_prompt.as_mut() { p.kill_word_back(); }
+            }
+            (KeyCode::Char(c), m)
+                if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(p) = self.dir_prompt.as_mut() { p.insert(c); }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_main_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), _) => self.should_quit = true,
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
+            (KeyCode::Esc, _) => {
+                if self.focus == Focus::Tabs {
+                    self.menu_stack.push(Menu::main());
+                } else {
+                    self.selected_repo = None;
+                    self.focus = Focus::Tabs;
+                    self.left_scroll = 0;
                 }
             }
+            (KeyCode::Left, _) | (KeyCode::Char('h'), _) => match self.focus {
+                Focus::Tabs => self.cycle_tab(-1),
+                Focus::Right | Focus::Left => self.focus = Focus::Left,
+            },
+            (KeyCode::Right, _) | (KeyCode::Char('l'), _) => match self.focus {
+                Focus::Tabs => self.cycle_tab(1),
+                Focus::Right | Focus::Left => self.focus = Focus::Right,
+            },
+            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => match self.focus {
+                Focus::Tabs => {}
+                Focus::Right => match self.selected_repo {
+                    // At the top of the list (or no cursor yet) → jump to tabs.
+                    None | Some(0) => {
+                        self.focus = Focus::Tabs;
+                        self.selected_repo = None;
+                    }
+                    Some(i) => {
+                        self.selected_repo = Some(i - 1);
+                        self.left_scroll = 0;
+                    }
+                },
+                Focus::Left => {
+                    if self.left_scroll == 0 {
+                        self.focus = Focus::Tabs;
+                    } else {
+                        self.scroll_left_pane(-1);
+                    }
+                }
+            },
+            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => match self.focus {
+                Focus::Tabs => self.enter_right_pane(),
+                Focus::Right => self.move_selection(1),
+                Focus::Left => self.scroll_left_pane(1),
+            },
+            _ => {}
         }
-        Ok(())
     }
 }
 
@@ -304,23 +611,133 @@ fn draw(f: &mut Frame, app: &App) {
         Tab::Placeholder1 | Tab::Placeholder2 => draw_placeholder(f, app, vertical[1]),
     }
 
-    if app.menu.is_some() {
+    if !app.menu_stack.is_empty() {
         draw_menu(f, app);
+    }
+    // Drawn last so it sits above the menu; if both were ever open at
+    // once the prompt wins (matches handle_events priority).
+    if app.dir_prompt.is_some() {
+        draw_directory_prompt(f, app);
     }
 }
 
+// Modal for picking / changing the watched directory. Renders a text
+// input with a horizontally-scrolling window so long paths stay usable,
+// plus optional error line and a keybinding hint.
+fn draw_directory_prompt(f: &mut Frame, app: &App) {
+    let Some(prompt) = &app.dir_prompt else { return };
+
+    let full = f.area();
+    // Cap the modal so it doesn't dominate a wide terminal but grows
+    // wide enough to make long paths comfortable.
+    let width = full.width.clamp(40, 72);
+    let height: u16 = if prompt.error.is_some() { 9 } else { 7 };
+    let area = centered_rect(width, height, full);
+    f.render_widget(Clear, area);
+
+    let title = if prompt.can_cancel {
+        " Watch directory "
+    } else {
+        " Welcome — pick a directory to watch "
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+
+    let label = "Directory: ";
+    let label_len = label.chars().count();
+    // Space for the input inside the block, after the label. `saturating_sub`
+    // handles a pathologically narrow terminal — width is clamped above but
+    // if the label wouldn't fit, `input_area_width` collapses to 0 and the
+    // input just doesn't render (still no panic).
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let input_area_width = inner_width.saturating_sub(label_len);
+    let (visible, cursor_offset) =
+        input_window(&prompt.input, prompt.cursor, input_area_width);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(label, Style::default().fg(Color::DarkGray)),
+        Span::raw(visible),
+    ]));
+    if let Some(err) = &prompt.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            err.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    let hint = if prompt.can_cancel {
+        "Enter to save · Esc to cancel"
+    } else {
+        "Enter to save · Ctrl-C to quit"
+    };
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let para = Paragraph::new(lines).style(Style::reset()).block(block);
+    f.render_widget(para, area);
+
+    // Position the terminal cursor at the input caret so it blinks in the
+    // right spot. Line 0 (inside the block) is blank; input sits on line 1.
+    if input_area_width > 0 {
+        let cursor_x = area.x + 1 + label_len as u16 + cursor_offset as u16;
+        let cursor_y = area.y + 2;
+        f.set_cursor_position(Position { x: cursor_x, y: cursor_y });
+    }
+}
+
+// Compute a (visible_slice, cursor_within_slice) pair that keeps the
+// caret inside a fixed-width window. Reserves one column for the trailing
+// caret position (when the cursor is at the end of the input) so it never
+// paints on the block border.
+fn input_window(input: &str, cursor: usize, width: usize) -> (String, usize) {
+    if width == 0 {
+        return (String::new(), 0);
+    }
+    // Reserve the last column for a caret sitting at end-of-input.
+    let cap = width - 1;
+    if cap == 0 {
+        return (String::new(), 0);
+    }
+    let chars: Vec<char> = input.chars().collect();
+    let count = chars.len();
+    if count <= cap {
+        return (input.to_string(), cursor.min(count));
+    }
+    // Keep the caret a few cells from the left edge when scrolling right,
+    // so users see some context to the left of where they're typing.
+    let margin = 2usize.min(cap / 4);
+    let ideal_start = cursor.saturating_sub(margin);
+    let max_start = count - cap;
+    let start = ideal_start.min(max_start);
+    let visible: String = chars[start..start + cap].iter().collect();
+    (visible, cursor - start)
+}
+
 fn draw_menu(f: &mut Frame, app: &App) {
-    let Some(menu) = &app.menu else { return };
-    let area = centered_rect(28, 6, f.area());
+    // Draw the top-of-stack level. Lower levels sit behind it; when this
+    // one pops on Esc, the next tick redraws whichever was underneath.
+    let Some(menu) = app.menu_stack.last() else { return };
+    let labels = menu.labels();
+    // Size the modal to the item count so a single-item Settings menu
+    // doesn't look empty at the same height as a fuller menu.
+    let height = (labels.len() as u16 + 4).max(5);
+    let area = centered_rect(28, height, f.area());
     // Clear underneath so the menu isn't blended with what's below.
     f.render_widget(Clear, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" Menu — Esc to close ");
+        .title(menu.title());
 
-    let lines: Vec<Line<'static>> = MENU_LABELS
+    let lines: Vec<Line<'static>> = labels
         .iter()
         .enumerate()
         .map(|(i, label)| {
@@ -988,9 +1405,18 @@ fn branch_spans(branch: &git::BranchInfo, now: u64) -> Vec<Span<'static>> {
 }
 
 // Pick the conventional trunk branch so feature branches nest under it.
+// Prefers a local trunk; falls back to origin/main-style remote-only
+// trunks so a repo that hasn't checked anything out still nests correctly.
 fn pick_trunk_idx(branches: &[git::BranchInfo]) -> Option<usize> {
-    for name in ["main", "master", "develop", "trunk"] {
+    const TRUNKS: [&str; 4] = ["main", "master", "develop", "trunk"];
+    for name in TRUNKS {
         if let Some(i) = branches.iter().position(|b| b.name == name) {
+            return Some(i);
+        }
+    }
+    for name in TRUNKS {
+        let remote = format!("origin/{name}");
+        if let Some(i) = branches.iter().position(|b| b.name == remote) {
             return Some(i);
         }
     }

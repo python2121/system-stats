@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::config;
+
 const SCAN_INTERVAL: Duration = Duration::from_secs(30);
-const SUBPATH: &str = "Documents/code";
 const MAX_REPOS: usize = 30;
 const MAX_BRANCHES_PER_REPO: usize = 8;
 const HEATMAP_LOOKBACK_DAYS: u32 = 400;
@@ -14,6 +16,10 @@ const GRAPH_MAX_ROWS: usize = 200;
 const MAX_RECENT_COMMITS: usize = 200;
 
 pub struct GitTree {
+    // The absolute path this tree was scanned from. Kept so the UI can drop
+    // any tree that lands after the user changed the watch dir, avoiding a
+    // one-frame flash of stale results.
+    pub root: PathBuf,
     pub root_display: String,
     pub total_repos: usize,
     pub repos: Vec<RepoSummary>,
@@ -48,6 +54,9 @@ pub struct GraphRow {
 
 pub struct RepoSummary {
     pub name: String,
+    // Absolute path to the repo — used by the graph fetcher so we don't have
+    // to re-derive it from name + a hardcoded root.
+    pub path: PathBuf,
     pub most_recent_commit: Option<u64>,
     pub branches: Vec<BranchInfo>,
     pub is_dirty: bool,
@@ -72,34 +81,76 @@ pub struct BranchInfo {
     pub last_message: String,
 }
 
-pub fn spawn_scanner() -> Receiver<GitTree> {
-    let (tx, rx) = mpsc::channel();
+// Owns the scanner thread. The UI holds one and reads new trees from
+// `tree_rx`; changing the watched directory is a two-step message:
+// swap the Mutex-guarded path, then poke the wake channel so the thread
+// stops mid-sleep and rescans immediately.
+pub struct Scanner {
+    tree_rx: Receiver<GitTree>,
+    wake_tx: Sender<()>,
+    root: Arc<Mutex<PathBuf>>,
+}
+
+impl Scanner {
+    pub fn try_recv(&self) -> Result<GitTree, mpsc::TryRecvError> {
+        self.tree_rx.try_recv()
+    }
+
+    // Switch the watched directory and kick off a rescan right now instead
+    // of waiting up to SCAN_INTERVAL for the next tick.
+    pub fn set_root(&self, new_root: PathBuf) {
+        if let Ok(mut guard) = self.root.lock() {
+            *guard = new_root;
+        }
+        // Ignore SendError — a full/disconnected channel just means the
+        // thread is exiting; either way the settings write already happened.
+        let _ = self.wake_tx.send(());
+    }
+}
+
+pub fn spawn_scanner(initial_root: PathBuf) -> Scanner {
+    let (tree_tx, tree_rx) = mpsc::channel();
+    let (wake_tx, wake_rx) = mpsc::channel();
+    let root = Arc::new(Mutex::new(initial_root));
+    let thread_root = Arc::clone(&root);
     thread::spawn(move || {
         loop {
-            if let Some(tree) = scan() {
-                if tx.send(tree).is_err() {
-                    // UI dropped the receiver; we're done.
-                    return;
+            let current = thread_root.lock().ok().map(|g| g.clone());
+            if let Some(root) = current {
+                if let Some(tree) = scan(&root) {
+                    if tree_tx.send(tree).is_err() {
+                        // UI dropped the receiver; we're done.
+                        return;
+                    }
                 }
             }
-            thread::sleep(SCAN_INTERVAL);
+            match wake_rx.recv_timeout(SCAN_INTERVAL) {
+                Ok(()) => {
+                    // Drain any additional wakes so a burst of set_root
+                    // calls collapses into a single rescan.
+                    while wake_rx.try_recv().is_ok() {}
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
         }
     });
-    rx
+    Scanner { tree_rx, wake_tx, root }
 }
 
-fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
-
-pub fn repo_dir(name: &str) -> Option<PathBuf> {
-    Some(home()?.join(SUBPATH).join(name))
-}
-
-fn scan() -> Option<GitTree> {
-    let root = home()?.join(SUBPATH);
+fn scan(root: &Path) -> Option<GitTree> {
     if !root.is_dir() {
-        return None;
+        // Still emit a tree so the UI can render an "empty" state
+        // rather than sitting on "scanning …" forever.
+        return Some(GitTree {
+            root: root.to_path_buf(),
+            root_display: config::display_path(root),
+            total_repos: 0,
+            repos: Vec::new(),
+            recent_commits: Vec::new(),
+            commit_days: HashMap::new(),
+            scanned_at: Instant::now(),
+        });
     }
 
     let repo_paths: Vec<PathBuf> = std::fs::read_dir(&root)
@@ -138,7 +189,8 @@ fn scan() -> Option<GitTree> {
     repos.truncate(MAX_REPOS);
 
     Some(GitTree {
-        root_display: format!("~/{SUBPATH}"),
+        root: root.to_path_buf(),
+        root_display: config::display_path(root),
         total_repos,
         repos,
         recent_commits,
@@ -219,6 +271,7 @@ fn summarize_repo(
     branches.truncate(MAX_BRANCHES_PER_REPO);
     let summary = RepoSummary {
         name,
+        path: path.to_path_buf(),
         most_recent_commit,
         branches,
         is_dirty,
@@ -345,6 +398,11 @@ fn git_current_branch(path: &Path) -> Option<String> {
 }
 
 fn git_branches(path: &Path) -> Vec<BranchInfo> {
+    // Ask for local heads AND origin's remote refs in one shot. Two
+    // patterns to `for-each-ref` come back in one committerdate-sorted
+    // stream, saving a fork/exec per repo. We deliberately don't include
+    // other remotes (e.g. `upstream` on forked repos) — those aren't the
+    // user's branches, they're the parent project's.
     let out = match Command::new("git")
         .arg("-C")
         .arg(path)
@@ -353,6 +411,7 @@ fn git_branches(path: &Path) -> Vec<BranchInfo> {
             "--sort=-committerdate",
             "--format=%(refname:short)|%(committerdate:unix)|%(upstream:track)|%(subject)",
             "refs/heads/",
+            "refs/remotes/origin/",
         ])
         .output()
     {
@@ -360,26 +419,46 @@ fn git_branches(path: &Path) -> Vec<BranchInfo> {
         _ => return Vec::new(),
     };
 
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| {
-            // splitn(4) so a '|' inside the subject doesn't break parsing.
-            let mut parts = line.splitn(4, '|');
-            let name = parts.next()?.to_string();
-            let ts: Option<u64> = parts.next()?.parse().ok();
-            let track = parts.next().unwrap_or("");
-            let subject = parts.next().unwrap_or("").to_string();
-            let (ahead, behind) = parse_track(track);
-            Some(BranchInfo {
-                name,
-                is_current: false,
-                ahead,
-                behind,
-                last_commit: ts,
-                last_message: subject,
-            })
-        })
-        .collect()
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut locals: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut all: Vec<BranchInfo> = Vec::new();
+    for line in text.lines() {
+        // splitn(4) so a '|' inside the subject doesn't break parsing.
+        let mut parts = line.splitn(4, '|');
+        let Some(name) = parts.next() else { continue };
+        // `origin/HEAD` is a symbolic ref pointing at (typically) `origin/main`.
+        // Including it would duplicate the branch it points at.
+        if name == "origin/HEAD" {
+            continue;
+        }
+        let name = name.to_string();
+        let Some(ts_str) = parts.next() else { continue };
+        let ts: Option<u64> = ts_str.parse().ok();
+        let track = parts.next().unwrap_or("");
+        let subject = parts.next().unwrap_or("").to_string();
+        let (ahead, behind) = parse_track(track);
+        if !name.starts_with("origin/") {
+            locals.insert(name.clone());
+        }
+        all.push(BranchInfo {
+            name,
+            is_current: false,
+            ahead,
+            behind,
+            last_commit: ts,
+            last_message: subject,
+        });
+    }
+
+    // Drop remote branches that already have a local counterpart with the
+    // same short name — the local BranchInfo already carries the ahead/behind
+    // tracking info, so keeping the remote copy would be redundant. Retain
+    // preserves the sorted-by-committerdate order from for-each-ref.
+    all.retain(|b| match b.name.strip_prefix("origin/") {
+        Some(short) => !locals.contains(short),
+        None => true,
+    });
+    all
 }
 
 // git's %(upstream:track) values: "", "[gone]", "[ahead N]", "[behind N]",
