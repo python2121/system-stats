@@ -726,17 +726,52 @@ fn render_recent_commits(commits: &[RecentCommit]) -> Vec<Line<'static>> {
 // Color the graph drawing column-by-column so each lane reads as a distinct
 // color. This is an approximation — git's lanes can shift columns at merges
 // and branches — but it's cheap and visually close to a true swim-lane view.
+// Palette borrowed from VSCode's GitHub Graph / GitHub's own PR graph:
+// blue leads (so `main` at column 0 gets the trunk color), then bright,
+// well-separated hues that read clearly on both dark and light backgrounds.
 const LANE_COLORS: [Color; 6] = [
-    Color::Rgb(57, 211, 83),   // green
-    Color::Rgb(217, 80, 188),  // magenta
-    Color::Rgb(99, 167, 255),  // blue
-    Color::Rgb(252, 199, 75),  // amber
-    Color::Rgb(255, 110, 110), // coral
-    Color::Rgb(120, 219, 226), // cyan
+    Color::Rgb(88, 166, 255),  // blue    — #58A6FF (trunk)
+    Color::Rgb(247, 120, 186), // pink    — #F778BA
+    Color::Rgb(126, 231, 135), // green   — #7EE787
+    Color::Rgb(240, 184, 74),  // amber   — #F0B84A
+    Color::Rgb(163, 113, 247), // purple  — #A371F7
+    Color::Rgb(255, 122, 89),  // orange  — #FF7A59
 ];
 
 fn lane_color(col: usize) -> Color {
     LANE_COLORS[(col / 2) % LANE_COLORS.len()]
+}
+
+// Diagonals sit in the gap columns between two lanes. In git's `--graph`
+// output they always connect the lane on their right (the branch splitting
+// off or merging in), so color them with that lane's hue rather than the
+// trunk's. Without this the curves all read as blue.
+fn glyph_color(col: usize, ch: char) -> Color {
+    let effective_col = match ch {
+        '/' | '\\' => col + 1,
+        _ => col,
+    };
+    lane_color(effective_col)
+}
+
+// Turn one raw `git log --graph` glyph into its Unicode box-drawing sibling
+// so lanes read as smooth vertical rails and merges as ring nodes, à la
+// VSCode's GitHub Graph. `is_merge` only affects the commit glyph.
+fn beautify_glyph(ch: char, is_merge: bool) -> char {
+    match ch {
+        '*' => {
+            if is_merge {
+                '◉'
+            } else {
+                '●'
+            }
+        }
+        '|' => '│',
+        '/' => '╱',
+        '\\' => '╲',
+        '_' => '─',
+        c => c,
+    }
 }
 
 fn render_graph(rows: &[GraphRow]) -> Vec<Line<'static>> {
@@ -748,16 +783,21 @@ fn render_graph(rows: &[GraphRow]) -> Vec<Line<'static>> {
     rows.iter()
         .map(|row| {
             let mut spans: Vec<Span<'static>> = Vec::new();
-            // Graph drawing chars, colored by column.
+            // Graph drawing chars — swapped for Unicode box-drawing glyphs
+            // and colored by column so each lane reads as a distinct swim lane.
             for (i, ch) in row.prefix.chars().enumerate() {
                 if ch == ' ' {
                     spans.push(Span::raw(" "));
-                } else {
-                    spans.push(Span::styled(
-                        ch.to_string(),
-                        Style::default().fg(lane_color(i)),
-                    ));
+                    continue;
                 }
+                let glyph = beautify_glyph(ch, row.is_merge);
+                let mut style = Style::default().fg(glyph_color(i, ch));
+                // Commit nodes are the visual anchors — bold makes them pop
+                // above the lane rails without changing width.
+                if ch == '*' {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                spans.push(Span::styled(glyph.to_string(), style));
             }
 
             // Connector-only rows (no commit on them) stop here.
@@ -795,31 +835,42 @@ fn render_graph(rows: &[GraphRow]) -> Vec<Line<'static>> {
 }
 
 fn ref_chip(r: &str) -> Span<'static> {
+    // VSCode-style: HEAD is a filled blue pill (the "you are here" marker),
+    // tags get a filled amber pill, local branches get a bright blue-tinted
+    // outline, and remote-tracking refs stay muted so the eye lands on HEAD.
     let (label, style) = if let Some(target) = r.strip_prefix("HEAD -> ") {
         (
-            format!(" HEAD→{target} "),
-            Style::default().bg(Color::Cyan).fg(Color::Black),
+            format!(" ◉ {target} "),
+            Style::default()
+                .bg(Color::Rgb(31, 111, 235)) // GitHub blue
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         )
     } else if r == "HEAD" {
         (
-            " HEAD ".to_string(),
-            Style::default().bg(Color::Cyan).fg(Color::Black),
+            " ◉ HEAD ".to_string(),
+            Style::default()
+                .bg(Color::Rgb(31, 111, 235))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         )
     } else if let Some(tag) = r.strip_prefix("tag: ") {
         (
             format!(" {tag} "),
-            Style::default().bg(Color::Yellow).fg(Color::Black),
+            Style::default()
+                .bg(Color::Rgb(219, 171, 10)) // amber
+                .fg(Color::Black),
         )
     } else if r.contains('/') {
-        // Remote-tracking branch — softer color so HEAD/tags stand out.
+        // Remote-tracking branch — muted so HEAD/local refs stand out.
         (
             format!(" {r} "),
-            Style::default().bg(Color::DarkGray).fg(Color::White),
+            Style::default().fg(Color::Rgb(139, 148, 158)),
         )
     } else {
         (
             format!(" {r} "),
-            Style::default().bg(Color::Magenta).fg(Color::Black),
+            Style::default().fg(Color::Rgb(88, 166, 255)),
         )
     };
     Span::styled(label, style)

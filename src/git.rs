@@ -41,6 +41,9 @@ pub struct GraphRow {
     pub author: String,
     pub subject: String,
     pub refs: Vec<String>,
+    // True when the commit has >1 parent — drives the ring-node glyph
+    // in the graph renderer.
+    pub is_merge: bool,
 }
 
 pub struct RepoSummary {
@@ -419,7 +422,7 @@ pub fn graph(repo_dir: &Path) -> Vec<GraphRow> {
             "--graph",
             "--date-order",
             "--decorate=short",
-            "--format=%x00%H%x1f%ct%x1f%an%x1f%s%x1f%D",
+            "--format=%x00%H%x1f%ct%x1f%an%x1f%s%x1f%D%x1f%P",
             &format!("-n{GRAPH_MAX_ROWS}"),
         ])
         .output()
@@ -442,6 +445,7 @@ fn parse_graph_line(line: &str) -> GraphRow {
             author: String::new(),
             subject: String::new(),
             refs: Vec::new(),
+            is_merge: false,
         };
     };
 
@@ -451,12 +455,14 @@ fn parse_graph_line(line: &str) -> GraphRow {
     let author = parts.next().unwrap_or("").to_string();
     let subject = parts.next().unwrap_or("").to_string();
     let refs_raw = parts.next().unwrap_or("");
+    let parents_raw = parts.next().unwrap_or("");
 
     let refs: Vec<String> = refs_raw
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+    let is_merge = parents_raw.split_whitespace().count() > 1;
 
     GraphRow {
         prefix: prefix.to_string(),
@@ -465,6 +471,7 @@ fn parse_graph_line(line: &str) -> GraphRow {
         author,
         subject,
         refs,
+        is_merge,
     }
 }
 
