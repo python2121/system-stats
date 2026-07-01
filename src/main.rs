@@ -1,5 +1,6 @@
 mod config;
 mod git;
+mod network;
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -12,11 +13,12 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Tabs},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Tabs},
 };
 
 use config::Config;
 use git::{GitTree, GraphRow, RecentCommit, Scanner, spawn_scanner};
+use network::{AppStat, Monitor, NetworkState};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -30,11 +32,11 @@ enum Focus {
 enum Tab {
     GitStatus,
     Placeholder1,
-    Placeholder2,
+    Network,
 }
 
-const TABS: [Tab; 3] = [Tab::GitStatus, Tab::Placeholder1, Tab::Placeholder2];
-const TAB_LABELS: [&str; 3] = ["Git Status", "Placeholder 1", "Placeholder 2"];
+const TABS: [Tab; 3] = [Tab::GitStatus, Tab::Placeholder1, Tab::Network];
+const TAB_LABELS: [&str; 3] = ["Git Status", "Placeholder 1", "Network"];
 
 impl Tab {
     fn index(self) -> usize {
@@ -233,6 +235,16 @@ struct App {
     // so that scroll input can clamp against the actual rendered size.
     left_content_lines: Cell<u16>,
     left_inner_height: Cell<u16>,
+    // Scroll offset for the right (git-activity) pane. Driven by selection:
+    // moving the cursor past the visible bottom shifts this to bring the
+    // selected repo back into view. Cell so draw() can nudge it without
+    // needing &mut self.
+    right_scroll: Cell<u16>,
+    // Optional because `nettop` might fail to spawn (e.g. quarantined
+    // binary, missing entitlement). We render a friendly error in that
+    // case instead of crashing.
+    net_monitor: Option<Monitor>,
+    net_state: NetworkState,
     // Modal menu stack. Empty when no menu is showing. Esc pops one level;
     // picking an item can push another level (e.g. Main → Settings).
     // Always renders the top-of-stack; lower levels are hidden behind it.
@@ -268,9 +280,24 @@ impl App {
             left_scroll: 0,
             left_content_lines: Cell::new(0),
             left_inner_height: Cell::new(0),
+            right_scroll: Cell::new(0),
+            net_monitor: network::spawn_monitor(),
+            net_state: NetworkState::new(),
             menu_stack: Vec::new(),
             dir_prompt,
             should_quit: false,
+        }
+    }
+
+    fn drain_network_updates(&mut self) {
+        let Some(mon) = &self.net_monitor else { return };
+        // Fold every pending sample. In practice one per tick, but
+        // handles bursts (e.g. after a stall) cleanly.
+        loop {
+            match mon.try_recv() {
+                Ok(sample) => self.net_state.apply_sample(sample),
+                Err(_) => break,
+            }
         }
     }
 
@@ -435,6 +462,7 @@ impl App {
             self.graph_cache.clear();
             self.selected_repo = None;
             self.left_scroll = 0;
+            self.right_scroll.set(0);
             self.focus = Focus::Tabs;
         }
         self.dir_prompt = None;
@@ -539,6 +567,7 @@ impl App {
                     self.selected_repo = None;
                     self.focus = Focus::Tabs;
                     self.left_scroll = 0;
+                    self.right_scroll.set(0);
                 }
             }
             (KeyCode::Left, _) | (KeyCode::Char('h'), _) => match self.focus {
@@ -591,6 +620,7 @@ fn main() -> std::io::Result<()> {
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     while !app.should_quit {
         app.drain_git_updates();
+        app.drain_network_updates();
         app.ensure_graph_loaded();
         terminal.draw(|f| draw(f, app))?;
         app.handle_events()?;
@@ -608,7 +638,8 @@ fn draw(f: &mut Frame, app: &App) {
 
     match app.selected_tab {
         Tab::GitStatus => draw_git_status(f, app, vertical[1]),
-        Tab::Placeholder1 | Tab::Placeholder2 => draw_placeholder(f, app, vertical[1]),
+        Tab::Placeholder1 => draw_placeholder(f, app, vertical[1]),
+        Tab::Network => draw_network(f, app, vertical[1]),
     }
 
     if !app.menu_stack.is_empty() {
@@ -1316,14 +1347,46 @@ fn draw_right_pane(f: &mut Frame, app: &App, area: Rect) {
                 " Git activity — {} repos in {}  (scanned {}s ago){hint}",
                 tree.total_repos, tree.root_display, rounded,
             );
-            let lines = render_git_tree(tree, app.selected_repo);
+            let (lines, extents) = render_git_tree(tree, app.selected_repo);
+
+            // Auto-scroll to keep the selected repo in view. The Paragraph
+            // clips content past the pane's height, so without this a
+            // selection past the bottom edge is invisible and Down feels
+            // like it "stops" — which is exactly the bug this fixes.
+            let inner_height = area.height.saturating_sub(2);
+            let content_lines = lines.len() as u16;
+            let max_scroll = content_lines.saturating_sub(inner_height);
+            let mut scroll = app.right_scroll.get();
+            if let Some(idx) = app.selected_repo {
+                if let Some(&(start, height)) = extents.get(idx) {
+                    if start < scroll {
+                        // Selection is above viewport — reveal its top.
+                        scroll = start;
+                    } else if start + height > scroll + inner_height {
+                        // Selection extends past viewport bottom.
+                        // If the repo is taller than the pane we can't
+                        // show all of it, so anchor to its top instead
+                        // of hiding the header.
+                        scroll = if height >= inner_height {
+                            start
+                        } else {
+                            start + height - inner_height
+                        };
+                    }
+                }
+            }
+            scroll = scroll.min(max_scroll);
+            app.right_scroll.set(scroll);
+
             let para = Paragraph::new(lines)
                 .style(Style::reset())
+                .scroll((scroll, 0))
                 .block(base_block.title(title));
             f.render_widget(para, area);
         }
         None => {
-            let para = Paragraph::new("scanning ~/Documents/code …")
+            let msg = format!("scanning {} …", config::display_path(&app.config.watch_dir));
+            let para = Paragraph::new(msg)
                 .style(Style::reset())
                 .block(base_block.title(" Git activity "));
             f.render_widget(para, area);
@@ -1423,14 +1486,23 @@ fn pick_trunk_idx(branches: &[git::BranchInfo]) -> Option<usize> {
     None
 }
 
-fn render_git_tree(tree: &GitTree, selected: Option<usize>) -> Vec<Line<'static>> {
+// Returns the rendered lines and, for each repo, `(start_line, height)`
+// covering that repo's block (header + tree rows + trailing blank).
+// Callers use the extents to auto-scroll so the current selection stays
+// visible without needing to re-walk the tree.
+fn render_git_tree(
+    tree: &GitTree,
+    selected: Option<usize>,
+) -> (Vec<Line<'static>>, Vec<(u16, u16)>) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let mut lines: Vec<Line> = Vec::new();
+    let mut extents: Vec<(u16, u16)> = Vec::with_capacity(tree.repos.len());
 
     for (idx, repo) in tree.repos.iter().enumerate() {
+        let start = lines.len() as u16;
         let is_selected = selected == Some(idx);
         let age_secs = repo.most_recent_commit.map(|t| now.saturating_sub(t));
         let age_str = age_secs
@@ -1544,9 +1616,11 @@ fn render_git_tree(tree: &GitTree, selected: Option<usize>) -> Vec<Line<'static>
         }
 
         lines.push(Line::from(""));
+        let height = lines.len() as u16 - start;
+        extents.push((start, height));
     }
 
-    lines
+    (lines, extents)
 }
 
 fn format_age(secs: u64) -> String {
@@ -1576,5 +1650,415 @@ fn truncate(s: &str, max: usize) -> String {
         let cut: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{cut}…")
     }
+}
+
+// -------------------- network tab --------------------
+
+// Fixed column widths so numbers align vertically across app cards.
+const NET_NAME_COL: usize = 20;
+// "↓ 999.9 KB/s  ↑ 999.9 KB/s" — two arrows + two right-aligned rates.
+const NET_RATES_COL: usize = 26;
+// Share-of-bandwidth bar width, in cells.
+const NET_BAR_W: usize = 10;
+
+// Unicode block heights for sparklines and charts, ordered low → high.
+const SPARK_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+// Intensity ramps for the header charts (dim → bright), one per direction.
+const DOWN_RAMP: [Color; 3] = [
+    Color::Rgb(0, 109, 50),
+    Color::Rgb(38, 166, 65),
+    Color::Rgb(57, 211, 83),
+];
+const UP_RAMP: [Color; 3] = [
+    Color::Rgb(16, 90, 110),
+    Color::Rgb(34, 148, 172),
+    Color::Rgb(86, 204, 242),
+];
+
+// Palette of accent colors assigned to apps by name hash, so each app
+// keeps a stable, distinct hue across frames and runs.
+const APP_ACCENTS: [Color; 7] = [
+    Color::Rgb(88, 166, 255),  // blue
+    Color::Rgb(247, 120, 186), // pink
+    Color::Rgb(126, 231, 135), // green
+    Color::Rgb(240, 184, 74),  // amber
+    Color::Rgb(163, 113, 247), // purple
+    Color::Rgb(255, 122, 89),  // orange
+    Color::Rgb(118, 227, 234), // cyan
+];
+
+// FNV-1a over the app name → stable palette slot.
+fn app_accent(name: &str) -> Color {
+    let mut h: u32 = 2166136261;
+    for b in name.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    APP_ACCENTS[h as usize % APP_ACCENTS.len()]
+}
+
+fn draw_network(f: &mut Frame, app: &App, area: Rect) {
+    if app.net_monitor.is_none() {
+        let msg = "network monitor unavailable — `nettop` failed to spawn.\n\
+                   Try running `nettop -x -L 1` manually to confirm access.";
+        let para = Paragraph::new(msg)
+            .style(Style::default().fg(Color::Red))
+            .block(Block::default().borders(Borders::ALL).title(" Network "));
+        f.render_widget(para, area);
+        return;
+    }
+
+    // Header: side-by-side download/upload throughput charts (btop-style),
+    // then the per-application list underneath.
+    let zones = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Min(0)])
+        .split(area);
+    let halves = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(zones[0]);
+
+    let state = &app.net_state;
+    draw_rate_panel(f, halves[0], '↓', state.ema_total_in, &state.history_in, &DOWN_RAMP);
+    draw_rate_panel(f, halves[1], '↑', state.ema_total_out, &state.history_out, &UP_RAMP);
+    draw_app_list(f, state, zones[1]);
+}
+
+// One direction's throughput panel: current smoothed rate + window peak in
+// the title, rolling history as an intensity-colored bar chart inside.
+fn draw_rate_panel(
+    f: &mut Frame,
+    area: Rect,
+    arrow: char,
+    ema_bps: f64,
+    history: &std::collections::VecDeque<u32>,
+    ramp: &[Color; 3],
+) {
+    let peak = history.iter().copied().max().unwrap_or(0) as f64;
+    let title = Line::from(vec![
+        Span::styled(
+            format!(" {arrow} {} ", format_bps(ema_bps)),
+            Style::default().fg(ramp[2]).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("peak {} ", format_bps(peak)),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .style(Style::reset())
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let lines = render_history_bars(history, inner.width as usize, inner.height as usize, ramp);
+    f.render_widget(Paragraph::new(lines).style(Style::reset()), inner);
+}
+
+// Render a rate history as a multi-row bar chart built from stacked
+// eighth-blocks, colored by intensity. Newest sample at the right edge;
+// short histories are left-padded so the chart grows in from the right.
+fn render_history_bars(
+    history: &std::collections::VecDeque<u32>,
+    width: usize,
+    rows: usize,
+    ramp: &[Color; 3],
+) -> Vec<Line<'static>> {
+    let pad = width.saturating_sub(history.len());
+    let skip = history.len().saturating_sub(width);
+    let vals: Vec<u32> = history.iter().skip(skip).copied().collect();
+    let max = vals.iter().copied().max().unwrap_or(0).max(1);
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows);
+    for row in (0..rows).rev() {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(width + 1);
+        spans.push(Span::raw(" ".repeat(pad)));
+        for &v in &vals {
+            let ratio = v as f64 / max as f64;
+            // Column height in eighths of a row; non-zero traffic always
+            // gets at least one eighth so trickles stay visible.
+            let eighths = if v == 0 {
+                0
+            } else {
+                ((ratio * (rows * 8) as f64).round() as usize).max(1)
+            };
+            let cell = eighths.saturating_sub(row * 8).min(8);
+            if cell == 0 {
+                spans.push(Span::raw(" "));
+                continue;
+            }
+            let color = if ratio > 0.66 {
+                ramp[2]
+            } else if ratio > 0.33 {
+                ramp[1]
+            } else {
+                ramp[0]
+            };
+            spans.push(Span::styled(
+                SPARK_CHARS[cell - 1].to_string(),
+                Style::default().fg(color),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn draw_app_list(f: &mut Frame, state: &NetworkState, area: Rect) {
+    let apps = state.sorted_apps();
+    let sampled = state
+        .last_sample_at
+        .map(|t| format!("sampled {}s ago", (t.elapsed().as_secs() / 2) * 2))
+        .unwrap_or_else(|| "waiting for first sample".to_string());
+    let title = format!(
+        " Network — {} app{} · {sampled} ",
+        apps.len(),
+        if apps.len() == 1 { "" } else { "s" },
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .style(Style::reset())
+        .title(title);
+    let inner_width = area.width.saturating_sub(2) as usize;
+
+    let mut lines: Vec<Line<'static>> = vec![Line::from("")];
+    if state.last_sample_at.is_none() {
+        lines.push(Line::from(Span::styled(
+            "  gathering first samples … (nettop takes ~4s to prime)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else if apps.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no external traffic in the last 2 minutes.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        // Shares are relative to the sum over apps (not the raw system
+        // total) so the bars always add up to a full 100%.
+        let total_bps: f64 = apps.iter().map(|a| a.total_ema_bps()).sum();
+        for stat in apps {
+            append_app_card(&mut lines, stat, state, inner_width, total_bps);
+            lines.push(Line::from(""));
+        }
+    }
+    let para = Paragraph::new(lines).style(Style::reset()).block(block);
+    f.render_widget(para, area);
+}
+
+// One application "card": headline row (accent-colored name · share bar ·
+// sparkline · rates) plus its busiest remote hosts nested underneath.
+fn append_app_card(
+    lines: &mut Vec<Line<'static>>,
+    stat: &AppStat,
+    state: &NetworkState,
+    inner_width: usize,
+    total_bps: f64,
+) {
+    let accent = app_accent(&stat.name);
+    let idle_secs = stat.last_active.elapsed().as_secs();
+    let dim = idle_secs >= 30;
+    let bullet = if idle_secs < 4 {
+        "●"
+    } else if idle_secs < 30 {
+        "○"
+    } else {
+        "·"
+    };
+    let bullet_style = if dim {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(accent)
+    };
+
+    let name_display = truncate(&stat.name, NET_NAME_COL);
+    let name_pad = NET_NAME_COL.saturating_sub(name_display.chars().count());
+    let name_style = if dim {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(accent).add_modifier(Modifier::BOLD)
+    };
+
+    // Drop the share bar on narrow terminals rather than squeezing the
+    // sparkline out of existence.
+    let show_bar = inner_width >= 82;
+    let bar_cells = if show_bar { NET_BAR_W + 6 } else { 0 };
+    // Sparkline soaks up all remaining width so the rate columns land on
+    // the right edge — the same edge the host rows below align to.
+    let fixed = 4 + NET_NAME_COL + 1 + bar_cells + 2 + NET_RATES_COL + 2;
+    let spark_w = inner_width.saturating_sub(fixed).max(6);
+
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::raw("  "),
+        Span::styled(bullet.to_string(), bullet_style),
+        Span::raw(" "),
+        Span::styled(name_display, name_style),
+        Span::raw(" ".repeat(name_pad + 1)),
+    ];
+
+    if show_bar {
+        let share = if total_bps > 0.0 {
+            stat.total_ema_bps() / total_bps
+        } else {
+            0.0
+        };
+        let filled = ((share * NET_BAR_W as f64).round() as usize).min(NET_BAR_W);
+        let bar_color = if dim { Color::DarkGray } else { accent };
+        spans.push(Span::styled(
+            "▰".repeat(filled),
+            Style::default().fg(bar_color),
+        ));
+        spans.push(Span::styled(
+            "▱".repeat(NET_BAR_W - filled),
+            Style::default().fg(Color::Rgb(60, 66, 74)),
+        ));
+        spans.push(Span::styled(
+            format!(" {:>3.0}%", share * 100.0),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::raw(" "));
+    }
+
+    let spark_style = if dim {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(accent)
+    };
+    spans.push(Span::styled(
+        build_sparkline(&stat.history, spark_w),
+        spark_style,
+    ));
+    spans.push(Span::raw("  "));
+    spans.extend(rate_spans(stat.ema_bps_in, stat.ema_bps_out, dim));
+    lines.push(Line::from(spans));
+
+    // Busiest remote hosts, nested as a dim tree so the card reads
+    // "app → who it's talking to" at a glance.
+    let top = stat.top_hosts(3);
+    let extra_hosts = stat.hosts.len().saturating_sub(top.len());
+    // Sized so the host rows' rate columns land on the same right edge as
+    // the app row above: 4 indent + 3 connector + name + 1 + 11 conns +
+    // 2 + rates + 2 margin.
+    let host_name_w = inner_width
+        .saturating_sub(4 + 3 + 1 + 11 + 2 + NET_RATES_COL + 2)
+        .max(10);
+    let tree_style = Style::default().fg(Color::DarkGray);
+    for (i, (ip, host)) in top.iter().enumerate() {
+        let is_last = i == top.len() - 1 && extra_hosts == 0;
+        let connector = if is_last { "└─ " } else { "├─ " };
+        let name = state.hostname_for(ip).unwrap_or_else(|| ip.to_string());
+        let host_display = truncate(&name, host_name_w);
+        let host_pad = host_name_w.saturating_sub(host_display.chars().count());
+        let host_dim = dim || host.last_active.elapsed().as_secs() >= 30;
+        // conn_count decays to 0 when the connection closes — read that
+        // as "idle" rather than the nonsensical "0 conns".
+        let conns = if host.conn_count == 0 {
+            "idle".to_string()
+        } else {
+            format!(
+                "{} conn{}",
+                host.conn_count,
+                if host.conn_count == 1 { "" } else { "s" },
+            )
+        };
+        let mut host_spans: Vec<Span<'static>> = vec![
+            Span::raw("    "),
+            Span::styled(connector.to_string(), tree_style),
+            Span::styled(host_display, Style::default().fg(Color::Gray)),
+            Span::raw(" ".repeat(host_pad + 1)),
+            Span::styled(format!("{conns:>11}"), tree_style),
+            Span::raw("  "),
+        ];
+        host_spans.extend(rate_spans(host.ema_bps_in, host.ema_bps_out, host_dim));
+        lines.push(Line::from(host_spans));
+    }
+    if extra_hosts > 0 {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                format!(
+                    "└─ … {extra_hosts} more host{}",
+                    if extra_hosts == 1 { "" } else { "s" },
+                ),
+                tree_style,
+            ),
+        ]));
+    }
+}
+
+// "↓ 1.2 MB/s  ↑ 40 KB/s" as styled spans, right-aligned into fixed
+// columns so every row's numbers line up vertically.
+fn rate_spans(bps_in: f64, bps_out: f64, dim: bool) -> Vec<Span<'static>> {
+    let (in_style, out_style) = if dim {
+        (
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        (
+            Style::default().fg(Color::Green),
+            Style::default().fg(Color::Cyan),
+        )
+    };
+    vec![
+        Span::styled(format!("↓ {:>10}", format_bps(bps_in)), in_style),
+        Span::raw("  "),
+        Span::styled(format!("↑ {:>10}", format_bps(bps_out)), out_style),
+    ]
+}
+
+// bytes/sec → human-readable with an SI (decimal) suffix. Decimal because
+// network throughput is conventionally reported that way and it lines up
+// with what other tools (nettop, iftop, bandwhich) show.
+fn format_bps(bps: f64) -> String {
+    let bps = bps.max(0.0);
+    if bps < 1000.0 {
+        format!("{:.0} B/s", bps)
+    } else if bps < 1_000_000.0 {
+        format!("{:.1} KB/s", bps / 1000.0)
+    } else if bps < 1_000_000_000.0 {
+        format!("{:.2} MB/s", bps / 1_000_000.0)
+    } else {
+        format!("{:.2} GB/s", bps / 1_000_000_000.0)
+    }
+}
+
+// Render the rolling history as a fixed-width unicode block sparkline.
+// Height per column is normalised against the app's own peak so the
+// shape shows *burstiness* rather than raw amplitude — absolute magnitude
+// is conveyed by the numeric rate on the same line.
+fn build_sparkline(history: &std::collections::VecDeque<u32>, width: usize) -> String {
+    if width == 0 { return String::new(); }
+    let max = history.iter().copied().max().unwrap_or(0);
+    let mut out = String::with_capacity(width * 3); // block chars are multi-byte
+    // Left-pad with spaces if we don't have `width` samples yet, so
+    // freshly-added apps don't have their sparkline hug the name column.
+    if history.len() < width {
+        for _ in 0..(width - history.len()) {
+            out.push(' ');
+        }
+    }
+    let skip = history.len().saturating_sub(width);
+    for &v in history.iter().skip(skip) {
+        if v == 0 {
+            // Idle samples render as blanks so bursts stand out.
+            out.push(' ');
+        } else if max == 0 {
+            out.push(SPARK_CHARS[0]);
+        } else {
+            let ratio = v as f64 / max as f64;
+            let idx = (ratio * 7.0).round().clamp(0.0, 7.0) as usize;
+            out.push(SPARK_CHARS[idx]);
+        }
+    }
+    out
 }
 
