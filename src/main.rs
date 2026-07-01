@@ -11,15 +11,48 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Tabs},
 };
 
 use git::{GitTree, GraphRow, RecentCommit, spawn_scanner};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
+    // Top-of-screen tab bar. Left/Right cycle tabs; Down drops into the body.
+    Tabs,
     Left,
     Right,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    GitStatus,
+    Placeholder1,
+    Placeholder2,
+}
+
+const TABS: [Tab; 3] = [Tab::GitStatus, Tab::Placeholder1, Tab::Placeholder2];
+const TAB_LABELS: [&str; 3] = ["Git Status", "Placeholder 1", "Placeholder 2"];
+
+impl Tab {
+    fn index(self) -> usize {
+        TABS.iter().position(|t| *t == self).unwrap_or(0)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuItem {
+    Settings,
+    Exit,
+}
+
+const MENU_ITEMS: [MenuItem; 2] = [MenuItem::Settings, MenuItem::Exit];
+const MENU_LABELS: [&str; 2] = ["Settings", "Exit"];
+
+// Small modal shown when the user hits Esc on the tab bar. Owns its own
+// cursor so nav keys can drive it independently of the pane focus underneath.
+struct Menu {
+    selected: usize,
 }
 
 const EVENT_POLL: Duration = Duration::from_millis(250);
@@ -34,8 +67,10 @@ struct App {
     // Cached commit graphs keyed by repo name. Cleared when a new scan arrives
     // so a deleted/added repo can't show stale lines.
     graph_cache: HashMap<String, Vec<GraphRow>>,
-    // Which pane responds to Up/Down. Left/Right arrows swap this.
+    // Which zone responds to Up/Down/Left/Right.
     focus: Focus,
+    // Which top-level tab is active.
+    selected_tab: Tab,
     // Scroll offset (in lines) for the graph pane on the left. Reset when the
     // selection changes so a new pane starts at the top.
     left_scroll: u16,
@@ -43,6 +78,8 @@ struct App {
     // so that scroll input can clamp against the actual rendered size.
     left_content_lines: Cell<u16>,
     left_inner_height: Cell<u16>,
+    // When Some, an overlay menu is open and swallows all input until Esc.
+    menu: Option<Menu>,
     should_quit: bool,
 }
 
@@ -53,10 +90,12 @@ impl App {
             git_tree: None,
             selected_repo: None,
             graph_cache: HashMap::new(),
-            focus: Focus::Right,
+            focus: Focus::Tabs,
+            selected_tab: Tab::GitStatus,
             left_scroll: 0,
             left_content_lines: Cell::new(0),
             left_inner_height: Cell::new(0),
+            menu: None,
             should_quit: false,
         }
     }
@@ -110,6 +149,27 @@ impl App {
         self.left_scroll = next as u16;
     }
 
+    fn cycle_tab(&mut self, delta: i32) {
+        let n = TABS.len() as i32;
+        let cur = self.selected_tab.index() as i32;
+        let next = (cur + delta).clamp(0, n - 1) as usize;
+        self.selected_tab = TABS[next];
+    }
+
+    // Entering the git-activity pane from tabs: land the cursor on the top repo
+    // so there's a visible selection to navigate from.
+    fn enter_right_pane(&mut self) {
+        self.focus = Focus::Right;
+        let has_repos = self
+            .git_tree
+            .as_ref()
+            .map(|t| !t.repos.is_empty())
+            .unwrap_or(false);
+        if self.selected_repo.is_none() && has_repos {
+            self.selected_repo = Some(0);
+        }
+    }
+
     // Lazily fetch + cache the commit graph for the selected repo so we only
     // shell out to git when the user actually navigates to it.
     fn ensure_graph_loaded(&mut self) {
@@ -124,24 +184,81 @@ impl App {
         self.graph_cache.insert(repo.name.clone(), rows);
     }
 
+    fn menu_move(&mut self, delta: i32) {
+        if let Some(m) = &mut self.menu {
+            let n = MENU_ITEMS.len() as i32;
+            let next = (m.selected as i32 + delta).clamp(0, n - 1);
+            m.selected = next as usize;
+        }
+    }
+
+    fn menu_activate(&mut self) {
+        let Some(m) = &self.menu else { return };
+        match MENU_ITEMS[m.selected] {
+            MenuItem::Settings => {}
+            MenuItem::Exit => self.should_quit = true,
+        }
+    }
+
     fn handle_events(&mut self) -> std::io::Result<()> {
         if event::poll(EVENT_POLL)? {
             if let Event::Key(key) = event::read()? {
+                // While the menu is open it swallows every key except Ctrl-C.
+                if self.menu.is_some() {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
+                        (KeyCode::Esc, _) => self.menu = None,
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.menu_move(-1),
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.menu_move(1),
+                        (KeyCode::Enter, _) => self.menu_activate(),
+                        _ => {}
+                    }
+                    return Ok(());
+                }
+
                 match (key.code, key.modifiers) {
                     (KeyCode::Char('q'), _) => self.should_quit = true,
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
                     (KeyCode::Esc, _) => {
-                        self.selected_repo = None;
-                        self.focus = Focus::Right;
-                        self.left_scroll = 0;
+                        if self.focus == Focus::Tabs {
+                            self.menu = Some(Menu { selected: 0 });
+                        } else {
+                            self.selected_repo = None;
+                            self.focus = Focus::Tabs;
+                            self.left_scroll = 0;
+                        }
                     }
-                    (KeyCode::Left, _) | (KeyCode::Char('h'), _) => self.focus = Focus::Left,
-                    (KeyCode::Right, _) | (KeyCode::Char('l'), _) => self.focus = Focus::Right,
+                    (KeyCode::Left, _) | (KeyCode::Char('h'), _) => match self.focus {
+                        Focus::Tabs => self.cycle_tab(-1),
+                        Focus::Right | Focus::Left => self.focus = Focus::Left,
+                    },
+                    (KeyCode::Right, _) | (KeyCode::Char('l'), _) => match self.focus {
+                        Focus::Tabs => self.cycle_tab(1),
+                        Focus::Right | Focus::Left => self.focus = Focus::Right,
+                    },
                     (KeyCode::Up, _) | (KeyCode::Char('k'), _) => match self.focus {
-                        Focus::Right => self.move_selection(-1),
-                        Focus::Left => self.scroll_left_pane(-1),
+                        Focus::Tabs => {}
+                        Focus::Right => match self.selected_repo {
+                            // At the top of the list (or no cursor yet) → jump to tabs.
+                            None | Some(0) => {
+                                self.focus = Focus::Tabs;
+                                self.selected_repo = None;
+                            }
+                            Some(i) => {
+                                self.selected_repo = Some(i - 1);
+                                self.left_scroll = 0;
+                            }
+                        },
+                        Focus::Left => {
+                            if self.left_scroll == 0 {
+                                self.focus = Focus::Tabs;
+                            } else {
+                                self.scroll_left_pane(-1);
+                            }
+                        }
                     },
                     (KeyCode::Down, _) | (KeyCode::Char('j'), _) => match self.focus {
+                        Focus::Tabs => self.enter_right_pane(),
                         Focus::Right => self.move_selection(1),
                         Focus::Left => self.scroll_left_pane(1),
                     },
@@ -172,10 +289,77 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
 }
 
 fn draw(f: &mut Frame, app: &App) {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(f.area());
+
+    draw_tabs(f, app, vertical[0]);
+
+    match app.selected_tab {
+        Tab::GitStatus => draw_git_status(f, app, vertical[1]),
+        Tab::Placeholder1 | Tab::Placeholder2 => draw_placeholder(f, app, vertical[1]),
+    }
+
+    if app.menu.is_some() {
+        draw_menu(f, app);
+    }
+}
+
+fn draw_menu(f: &mut Frame, app: &App) {
+    let Some(menu) = &app.menu else { return };
+    let area = centered_rect(28, 6, f.area());
+    // Clear underneath so the menu isn't blended with what's below.
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Menu — Esc to close ");
+
+    let lines: Vec<Line<'static>> = MENU_LABELS
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let selected = i == menu.selected;
+            let marker = if selected { "▶ " } else { "  " };
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(vec![
+                Span::styled(marker, style),
+                Span::styled((*label).to_string(), style),
+            ])
+        })
+        .collect();
+
+    let para = Paragraph::new(lines)
+        .style(Style::reset())
+        .block(block);
+    f.render_widget(para, area);
+}
+
+// Center a `width × height` rect inside `area`, clamped to fit.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+fn draw_git_status(f: &mut Frame, app: &App, area: Rect) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(f.area());
+        .split(area);
 
     let left = Layout::default()
         .direction(Direction::Vertical)
@@ -185,6 +369,45 @@ fn draw(f: &mut Frame, app: &App) {
     draw_heatmap(f, app, left[0]);
     draw_graph(f, app, left[1]);
     draw_right_pane(f, app, columns[1]);
+}
+
+fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
+    let focused = app.focus == Focus::Tabs;
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::reset()
+    };
+    let highlight_style = if focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+    let titles: Vec<Line> = TAB_LABELS
+        .iter()
+        .map(|s| Line::from(Span::raw(*s)))
+        .collect();
+    let tabs = Tabs::new(titles)
+        .select(app.selected_tab.index())
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(highlight_style)
+        .divider(Span::styled("│", Style::default().fg(Color::DarkGray)))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style),
+        );
+    f.render_widget(tabs, area);
+}
+
+fn draw_placeholder(f: &mut Frame, _app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(Style::reset());
+    let para = Paragraph::new("").block(block);
+    f.render_widget(para, area);
 }
 
 fn draw_heatmap(f: &mut Frame, app: &App, area: Rect) {
