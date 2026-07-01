@@ -3313,10 +3313,9 @@ fn draw_battery_flow(f: &mut Frame, state: &HardwareState, bat: &BatterySnapshot
     if state.history_watts.iter().any(|w| *w != 0) {
         title_spans.push(Span::styled(
             format!(
-                "drain peak {:.1} W · charge peak {:.1} W · top {:.0} W ",
+                "drain peak {:.1} W · charge peak {:.1} W ",
                 drain_peak as f64 / 10.0,
                 charge_peak as f64 / 10.0,
-                scale as f64 / 10.0,
             ),
             Style::default().fg(Color::DarkGray),
         ));
@@ -3333,13 +3332,61 @@ fn draw_battery_flow(f: &mut Frame, state: &HardwareState, bat: &BatterySnapshot
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let lines = render_flow_line(
-        &state.history_watts,
-        inner.width as usize,
-        inner.height as usize,
-        scale,
-    );
+
+    // Left gutter: watt labels + axis, chart fills the rest. Skip the
+    // axis entirely on absurdly narrow panels.
+    const GUTTER_W: u16 = 7;
+    let rows = inner.height as usize;
+    let chart_w = if inner.width > GUTTER_W + 8 {
+        (inner.width - GUTTER_W) as usize
+    } else {
+        inner.width as usize
+    };
+    let mut lines = render_flow_line(&state.history_watts, chart_w, rows, scale);
+    if chart_w < inner.width as usize {
+        let ticks = axis_ticks(rows, scale);
+        for (r, line) in lines.iter_mut().enumerate() {
+            let gutter = match ticks.iter().find(|(row, _)| *row == r) {
+                Some((_, watts)) => format!("{:>5} ┤", format_watts_label(*watts)),
+                None => "      │".to_string(),
+            };
+            line.spans
+                .insert(0, Span::styled(gutter, Style::default().fg(Color::DarkGray)));
+        }
+    }
     f.render_widget(Paragraph::new(lines).style(Style::reset()), inner);
+}
+
+// Y-axis ticks for the flow chart: nice round watt values (the scale's
+// halves, plus quarters once the chart is tall enough) snapped to their
+// nearest row. Snapping keeps the labels round — 20/15/10/5/0 — at the
+// cost of at most half a row of placement error.
+fn axis_ticks(rows: usize, scale_deciwatts: u32) -> Vec<(usize, f64)> {
+    let denom = rows.saturating_sub(1).max(1);
+    let fracs: &[f64] = if rows >= 14 {
+        &[1.0, 0.75, 0.5, 0.25, 0.0]
+    } else if rows >= 6 {
+        &[1.0, 0.5, 0.0]
+    } else {
+        &[1.0, 0.0]
+    };
+    let mut ticks: Vec<(usize, f64)> = Vec::with_capacity(fracs.len());
+    for &frac in fracs {
+        let row = ((1.0 - frac) * denom as f64).round() as usize;
+        if ticks.iter().all(|(r, _)| *r != row) {
+            ticks.push((row, scale_deciwatts as f64 / 10.0 * frac));
+        }
+    }
+    ticks
+}
+
+// "12" for whole watts, "2.5" when the tick lands on a fraction.
+fn format_watts_label(watts: f64) -> String {
+    if (watts - watts.round()).abs() < 0.05 {
+        format!("{watts:.0}")
+    } else {
+        format!("{watts:.1}")
+    }
 }
 
 // Smallest 1/2/5 × 10^k that covers `x` — a chart ceiling that only
