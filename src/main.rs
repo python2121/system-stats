@@ -1,6 +1,8 @@
 mod config;
 mod git;
+mod hardware;
 mod network;
+mod processes;
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -18,7 +20,9 @@ use ratatui::{
 
 use config::Config;
 use git::{GitTree, GraphRow, RecentCommit, Scanner, spawn_scanner};
+use hardware::{BatterySnapshot, HardwareState};
 use network::{AppStat, Monitor, NetworkState};
+use processes::{ProcInfo, ProcessState};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -31,12 +35,13 @@ enum Focus {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     GitStatus,
-    Placeholder1,
+    Processes,
     Network,
+    DiskPower,
 }
 
-const TABS: [Tab; 3] = [Tab::GitStatus, Tab::Placeholder1, Tab::Network];
-const TAB_LABELS: [&str; 3] = ["Git Status", "Placeholder 1", "Network"];
+const TABS: [Tab; 4] = [Tab::GitStatus, Tab::Processes, Tab::Network, Tab::DiskPower];
+const TAB_LABELS: [&str; 4] = ["Git Status", "Processes", "Network", "Disk / Power"];
 
 impl Tab {
     fn index(self) -> usize {
@@ -245,6 +250,26 @@ struct App {
     // case instead of crashing.
     net_monitor: Option<Monitor>,
     net_state: NetworkState,
+    // Selection in the network app list, by canonical app name — a name
+    // rather than an index so the highlight stays glued to its app when
+    // the traffic-based sort reorders the list under the cursor.
+    net_selected: Option<String>,
+    // When Some, the network tab shows a full-screen detail view for
+    // this app. Esc drops back to the list.
+    net_detail: Option<String>,
+    // Scroll offset for the network app list; nudged during draw to keep
+    // the selection visible (same pattern as right_scroll).
+    net_scroll: Cell<u16>,
+    // Processes tab — same trio as the network tab: name-keyed selection,
+    // full-screen detail, draw-nudged scroll offset.
+    proc_monitor: processes::Monitor,
+    proc_state: ProcessState,
+    proc_selected: Option<String>,
+    proc_detail: Option<String>,
+    proc_scroll: Cell<u16>,
+    // Disk/power tab — a pure dashboard, so state only, no selection.
+    hw_monitor: hardware::Monitor,
+    hw_state: HardwareState,
     // Modal menu stack. Empty when no menu is showing. Esc pops one level;
     // picking an item can push another level (e.g. Main → Settings).
     // Always renders the top-of-stack; lower levels are hidden behind it.
@@ -283,6 +308,16 @@ impl App {
             right_scroll: Cell::new(0),
             net_monitor: network::spawn_monitor(),
             net_state: NetworkState::new(),
+            net_selected: None,
+            net_detail: None,
+            net_scroll: Cell::new(0),
+            proc_monitor: processes::spawn_monitor(),
+            proc_state: ProcessState::new(),
+            proc_selected: None,
+            proc_detail: None,
+            proc_scroll: Cell::new(0),
+            hw_monitor: hardware::spawn_monitor(),
+            hw_state: HardwareState::new(),
             menu_stack: Vec::new(),
             dir_prompt,
             should_quit: false,
@@ -298,6 +333,43 @@ impl App {
                 Ok(sample) => self.net_state.apply_sample(sample),
                 Err(_) => break,
             }
+        }
+        // An app pruned for inactivity can't stay selected or detailed.
+        if let Some(n) = &self.net_detail {
+            if !self.net_state.apps.contains_key(n) {
+                self.net_detail = None;
+            }
+        }
+        if let Some(n) = &self.net_selected {
+            if !self.net_state.apps.contains_key(n) {
+                self.net_selected = None;
+            }
+        }
+    }
+
+    fn drain_process_updates(&mut self) {
+        loop {
+            match self.proc_monitor.try_recv() {
+                Ok(sample) => self.proc_state.apply_sample(sample),
+                Err(_) => break,
+            }
+        }
+        // An app whose processes all exited can't stay selected or detailed.
+        if let Some(n) = &self.proc_detail {
+            if !self.proc_state.apps.contains_key(n) {
+                self.proc_detail = None;
+            }
+        }
+        if let Some(n) = &self.proc_selected {
+            if !self.proc_state.apps.contains_key(n) {
+                self.proc_selected = None;
+            }
+        }
+    }
+
+    fn drain_hardware_updates(&mut self) {
+        while let Ok(sample) = self.hw_monitor.try_recv() {
+            self.hw_state.apply_sample(sample);
         }
     }
 
@@ -392,6 +464,211 @@ impl App {
         }
         let rows = git::graph(&repo.path);
         self.graph_cache.insert(repo.name.clone(), rows);
+    }
+
+    fn net_sorted_names(&self) -> Vec<String> {
+        self.net_state
+            .sorted_apps()
+            .iter()
+            .map(|a| a.name.clone())
+            .collect()
+    }
+
+    // Move the network-list cursor by `delta` positions within the
+    // current traffic-sorted order. With nothing selected, any move
+    // lands on the top app.
+    fn move_net_selection(&mut self, delta: i32) {
+        let order = self.net_sorted_names();
+        if order.is_empty() {
+            return;
+        }
+        let next = match self
+            .net_selected
+            .as_ref()
+            .and_then(|n| order.iter().position(|o| o == n))
+        {
+            None => 0,
+            Some(i) => (i as i32 + delta).clamp(0, order.len() as i32 - 1) as usize,
+        };
+        self.net_selected = Some(order[next].clone());
+    }
+
+    // Returns true when the key was consumed by the network tab's own
+    // interactions; false lets the shared handler (quit keys, tab-bar
+    // cycling, menu) have it.
+    fn handle_network_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return false; // Ctrl-C etc. always reach the shared handler.
+        }
+        // Detail view: Esc drops back to the list; everything except
+        // quit is inert while it's open.
+        if self.net_detail.is_some() {
+            return match key.code {
+                KeyCode::Esc => {
+                    self.net_detail = None;
+                    true
+                }
+                KeyCode::Char('q') => false,
+                _ => true,
+            };
+        }
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.focus == Focus::Tabs {
+                    // Drop from the tab bar into the list, cursor on top.
+                    self.focus = Focus::Right;
+                    if self.net_selected.is_none() {
+                        self.move_net_selection(0);
+                    }
+                } else {
+                    self.move_net_selection(1);
+                }
+                true
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.focus == Focus::Tabs {
+                    return true;
+                }
+                let order = self.net_sorted_names();
+                let at_top = match &self.net_selected {
+                    Some(n) => order.first() == Some(n),
+                    None => true,
+                };
+                if at_top {
+                    // Past the top of the list → back up to the tab bar.
+                    self.focus = Focus::Tabs;
+                    self.net_selected = None;
+                } else {
+                    self.move_net_selection(-1);
+                }
+                true
+            }
+            KeyCode::Enter => {
+                if self.focus != Focus::Tabs {
+                    if let Some(n) = &self.net_selected {
+                        self.net_detail = Some(n.clone());
+                    }
+                }
+                true
+            }
+            KeyCode::Esc => {
+                if self.focus == Focus::Tabs {
+                    false // shared handler opens the menu
+                } else {
+                    self.net_selected = None;
+                    self.focus = Focus::Tabs;
+                    true
+                }
+            }
+            // In-list Left/Right is meaningless (single pane) — swallow
+            // so the git-tab pane-switching semantics don't kick in.
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+                self.focus != Focus::Tabs
+            }
+            _ => false,
+        }
+    }
+
+    fn proc_sorted_names(&self) -> Vec<String> {
+        self.proc_state
+            .visible_apps()
+            .iter()
+            .map(|a| a.name.clone())
+            .collect()
+    }
+
+    // Move the process-list cursor by `delta` positions within the
+    // current CPU-sorted order. Same semantics as move_net_selection.
+    fn move_proc_selection(&mut self, delta: i32) {
+        let order = self.proc_sorted_names();
+        if order.is_empty() {
+            return;
+        }
+        let next = match self
+            .proc_selected
+            .as_ref()
+            .and_then(|n| order.iter().position(|o| o == n))
+        {
+            None => 0,
+            Some(i) => (i as i32 + delta).clamp(0, order.len() as i32 - 1) as usize,
+        };
+        self.proc_selected = Some(order[next].clone());
+    }
+
+    // The processes tab's own interactions — a mirror of
+    // handle_network_key with the proc_* state. Returns true when the key
+    // was consumed; false lets the shared handler have it.
+    fn handle_process_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return false; // Ctrl-C etc. always reach the shared handler.
+        }
+        // Detail view: Esc drops back to the list; everything except
+        // quit is inert while it's open.
+        if self.proc_detail.is_some() {
+            return match key.code {
+                KeyCode::Esc => {
+                    self.proc_detail = None;
+                    true
+                }
+                KeyCode::Char('q') => false,
+                _ => true,
+            };
+        }
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.focus == Focus::Tabs {
+                    // Drop from the tab bar into the list, cursor on top.
+                    self.focus = Focus::Right;
+                    if self.proc_selected.is_none() {
+                        self.move_proc_selection(0);
+                    }
+                } else {
+                    self.move_proc_selection(1);
+                }
+                true
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.focus == Focus::Tabs {
+                    return true;
+                }
+                let order = self.proc_sorted_names();
+                let at_top = match &self.proc_selected {
+                    Some(n) => order.first() == Some(n),
+                    None => true,
+                };
+                if at_top {
+                    // Past the top of the list → back up to the tab bar.
+                    self.focus = Focus::Tabs;
+                    self.proc_selected = None;
+                } else {
+                    self.move_proc_selection(-1);
+                }
+                true
+            }
+            KeyCode::Enter => {
+                if self.focus != Focus::Tabs {
+                    if let Some(n) = &self.proc_selected {
+                        self.proc_detail = Some(n.clone());
+                    }
+                }
+                true
+            }
+            KeyCode::Esc => {
+                if self.focus == Focus::Tabs {
+                    false // shared handler opens the menu
+                } else {
+                    self.proc_selected = None;
+                    self.focus = Focus::Tabs;
+                    true
+                }
+            }
+            // In-list Left/Right is meaningless (single pane) — swallow
+            // so the git-tab pane-switching semantics don't kick in.
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+                self.focus != Focus::Tabs
+            }
+            _ => false,
+        }
     }
 
     fn menu_move(&mut self, delta: i32) {
@@ -557,6 +834,15 @@ impl App {
     }
 
     fn handle_main_key(&mut self, key: KeyEvent) {
+        // The network tab has its own selection/detail interactions; keys
+        // it doesn't consume (quit, tab cycling, menu) fall through to
+        // the shared handling below.
+        if self.selected_tab == Tab::Network && self.handle_network_key(key) {
+            return;
+        }
+        if self.selected_tab == Tab::Processes && self.handle_process_key(key) {
+            return;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), _) => self.should_quit = true,
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
@@ -600,7 +886,13 @@ impl App {
                 }
             },
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => match self.focus {
-                Focus::Tabs => self.enter_right_pane(),
+                // The disk/power tab is a dashboard with nothing to
+                // select — there's no body to drop into.
+                Focus::Tabs => {
+                    if self.selected_tab != Tab::DiskPower {
+                        self.enter_right_pane();
+                    }
+                }
                 Focus::Right => self.move_selection(1),
                 Focus::Left => self.scroll_left_pane(1),
             },
@@ -621,6 +913,8 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     while !app.should_quit {
         app.drain_git_updates();
         app.drain_network_updates();
+        app.drain_process_updates();
+        app.drain_hardware_updates();
         app.ensure_graph_loaded();
         terminal.draw(|f| draw(f, app))?;
         app.handle_events()?;
@@ -638,8 +932,9 @@ fn draw(f: &mut Frame, app: &App) {
 
     match app.selected_tab {
         Tab::GitStatus => draw_git_status(f, app, vertical[1]),
-        Tab::Placeholder1 => draw_placeholder(f, app, vertical[1]),
+        Tab::Processes => draw_processes(f, app, vertical[1]),
         Tab::Network => draw_network(f, app, vertical[1]),
+        Tab::DiskPower => draw_disk_power(f, app, vertical[1]),
     }
 
     if !app.menu_stack.is_empty() {
@@ -851,14 +1146,6 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
                 .border_style(border_style),
         );
     f.render_widget(tabs, area);
-}
-
-fn draw_placeholder(f: &mut Frame, _app: &App, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .style(Style::reset());
-    let para = Paragraph::new("").block(block);
-    f.render_widget(para, area);
 }
 
 fn draw_heatmap(f: &mut Frame, app: &App, area: Rect) {
@@ -1709,6 +1996,16 @@ fn draw_network(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let state = &app.net_state;
+
+    // Detail view replaces the whole tab body while open.
+    if let Some(name) = &app.net_detail {
+        if let Some(stat) = state.apps.get(name) {
+            draw_app_detail(f, state, stat, area);
+            return;
+        }
+    }
+
     // Header: side-by-side download/upload throughput charts (btop-style),
     // then the per-application list underneath.
     let zones = Layout::default()
@@ -1720,10 +2017,9 @@ fn draw_network(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(zones[0]);
 
-    let state = &app.net_state;
     draw_rate_panel(f, halves[0], '↓', state.ema_total_in, &state.history_in, &DOWN_RAMP);
     draw_rate_panel(f, halves[1], '↑', state.ema_total_out, &state.history_out, &UP_RAMP);
-    draw_app_list(f, state, zones[1]);
+    draw_app_list(f, app, zones[1]);
 }
 
 // One direction's throughput panel: current smoothed rate + window peak in
@@ -1747,6 +2043,21 @@ fn draw_rate_panel(
             Style::default().fg(Color::DarkGray),
         ),
     ]);
+    draw_chart_block(f, area, title, history, ramp, None);
+}
+
+// Bordered block with `title`, filled with an intensity-colored history
+// chart sized to whatever space the block encloses. `fixed_max` pins the
+// chart's ceiling to an absolute scale (e.g. 100% CPU, total RAM); None
+// normalizes against the window peak, right for unbounded rates.
+fn draw_chart_block(
+    f: &mut Frame,
+    area: Rect,
+    title: Line<'static>,
+    history: &std::collections::VecDeque<u32>,
+    ramp: &[Color; 3],
+    fixed_max: Option<u32>,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1758,8 +2069,169 @@ fn draw_rate_panel(
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let lines = render_history_bars(history, inner.width as usize, inner.height as usize, ramp);
+    let lines = render_history_bars(
+        history,
+        inner.width as usize,
+        inner.height as usize,
+        ramp,
+        fixed_max,
+    );
     f.render_widget(Paragraph::new(lines).style(Style::reset()), inner);
+}
+
+// Full-tab detail view for one app: tall download/upload history charts
+// (8 minutes of samples) and the complete remote-host table.
+fn draw_app_detail(f: &mut Frame, state: &NetworkState, stat: &AppStat, area: Rect) {
+    let accent = app_accent(&stat.name);
+    let zones = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    let peak_in = stat.history_in.iter().copied().max().unwrap_or(0) as f64;
+    let down_title = Line::from(vec![
+        Span::styled(
+            format!(" ● {} ", stat.name),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("· ↓ {} ", format_bps(stat.ema_bps_in)),
+            Style::default().fg(DOWN_RAMP[2]).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("peak {} ", format_bps(peak_in)),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    draw_chart_block(f, zones[0], down_title, &stat.history_in, &DOWN_RAMP, None);
+
+    let peak_out = stat.history_out.iter().copied().max().unwrap_or(0) as f64;
+    let up_title = Line::from(vec![
+        Span::styled(
+            format!(" ↑ {} ", format_bps(stat.ema_bps_out)),
+            Style::default().fg(UP_RAMP[2]).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("peak {} ", format_bps(peak_out)),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    draw_chart_block(f, zones[1], up_title, &stat.history_out, &UP_RAMP, None);
+
+    draw_detail_hosts(f, state, stat, zones[2]);
+}
+
+// Every remote host the app is talking to, busiest first: activity
+// bullet, hostname, share-of-app-traffic bar, conns, and rates.
+fn draw_detail_hosts(f: &mut Frame, state: &NetworkState, stat: &AppStat, area: Rect) {
+    let accent = app_accent(&stat.name);
+    let hosts = stat.top_hosts(stat.hosts.len());
+    let conns = if stat.conn_count == 0 {
+        "idle".to_string()
+    } else {
+        format!(
+            "{} conn{}",
+            stat.conn_count,
+            if stat.conn_count == 1 { "" } else { "s" },
+        )
+    };
+    let title = format!(
+        " Remote hosts — {} host{} · {conns} · Esc to close ",
+        hosts.len(),
+        if hosts.len() == 1 { "" } else { "s" },
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .style(Style::reset())
+        .title(title);
+    let inner_width = area.width.saturating_sub(2) as usize;
+
+    // 4 indent+bullet · name · 1 · bar 10 · pct 5 · 2 · conns 11 · 2 ·
+    // rates · 2 margin — same right-edge alignment as the list view.
+    let name_w = inner_width
+        .saturating_sub(4 + 1 + NET_BAR_W + 5 + 2 + 11 + 2 + NET_RATES_COL + 2)
+        .max(10);
+    let app_total = stat.total_ema_bps();
+
+    let mut lines: Vec<Line<'static>> = vec![Line::from("")];
+    if hosts.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no remote hosts in the last 2 minutes.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for (ip, host) in hosts {
+        let idle_secs = host.last_active.elapsed().as_secs();
+        let dim = idle_secs >= 30;
+        let bullet = if idle_secs < 4 {
+            "●"
+        } else if idle_secs < 30 {
+            "○"
+        } else {
+            "·"
+        };
+        let bullet_style = if dim {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(accent)
+        };
+        let name = state.hostname_for(&ip).unwrap_or_else(|| ip.to_string());
+        let name_display = truncate(&name, name_w);
+        let name_pad = name_w.saturating_sub(name_display.chars().count());
+        let name_style = if dim {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        let share = if app_total > 0.0 {
+            host.total_ema_bps() / app_total
+        } else {
+            0.0
+        };
+        let filled = ((share * NET_BAR_W as f64).round() as usize).min(NET_BAR_W);
+        let bar_color = if dim { Color::DarkGray } else { accent };
+        let conns = if host.conn_count == 0 {
+            "idle".to_string()
+        } else {
+            format!(
+                "{} conn{}",
+                host.conn_count,
+                if host.conn_count == 1 { "" } else { "s" },
+            )
+        };
+
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::raw("  "),
+            Span::styled(bullet.to_string(), bullet_style),
+            Span::raw(" "),
+            Span::styled(name_display, name_style),
+            Span::raw(" ".repeat(name_pad + 1)),
+            Span::styled("▰".repeat(filled), Style::default().fg(bar_color)),
+            Span::styled(
+                "▱".repeat(NET_BAR_W - filled),
+                Style::default().fg(Color::Rgb(60, 66, 74)),
+            ),
+            Span::styled(
+                format!(" {:>3.0}%", share * 100.0),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw("  "),
+            Span::styled(format!("{conns:>11}"), Style::default().fg(Color::DarkGray)),
+            Span::raw("  "),
+        ];
+        spans.extend(rate_spans(host.ema_bps_in, host.ema_bps_out, dim));
+        lines.push(Line::from(spans));
+    }
+
+    let para = Paragraph::new(lines).style(Style::reset()).block(block);
+    f.render_widget(para, area);
 }
 
 // Render a rate history as a multi-row bar chart built from stacked
@@ -1770,11 +2242,14 @@ fn render_history_bars(
     width: usize,
     rows: usize,
     ramp: &[Color; 3],
+    fixed_max: Option<u32>,
 ) -> Vec<Line<'static>> {
     let pad = width.saturating_sub(history.len());
     let skip = history.len().saturating_sub(width);
     let vals: Vec<u32> = history.iter().skip(skip).copied().collect();
-    let max = vals.iter().copied().max().unwrap_or(0).max(1);
+    let max = fixed_max
+        .unwrap_or_else(|| vals.iter().copied().max().unwrap_or(0))
+        .max(1);
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows);
     for row in (0..rows).rev() {
@@ -1811,14 +2286,49 @@ fn render_history_bars(
     lines
 }
 
-fn draw_app_list(f: &mut Frame, state: &NetworkState, area: Rect) {
+// Keep the selected card in view — Paragraph clips past the block height,
+// so without this the cursor could walk below the visible bottom and
+// appear stuck. Nudges the Cell-held offset during draw (same pattern as
+// right_scroll) and returns the clamped value to render with.
+fn scroll_into_view(
+    cell: &Cell<u16>,
+    selected_extent: Option<(u16, u16)>,
+    total_lines: u16,
+    inner_height: u16,
+) -> u16 {
+    let max_scroll = total_lines.saturating_sub(inner_height);
+    let mut scroll = cell.get();
+    if let Some((start, height)) = selected_extent {
+        if start < scroll {
+            scroll = start;
+        } else if start + height > scroll + inner_height {
+            scroll = if height >= inner_height {
+                start
+            } else {
+                start + height - inner_height
+            };
+        }
+    }
+    scroll = scroll.min(max_scroll);
+    cell.set(scroll);
+    scroll
+}
+
+fn draw_app_list(f: &mut Frame, app: &App, area: Rect) {
+    let state = &app.net_state;
     let apps = state.sorted_apps();
+    let focused = app.focus == Focus::Right;
     let sampled = state
         .last_sample_at
         .map(|t| format!("sampled {}s ago", (t.elapsed().as_secs() / 2) * 2))
         .unwrap_or_else(|| "waiting for first sample".to_string());
+    let hint = if focused {
+        " (↑/↓ select · Enter details)"
+    } else {
+        ""
+    };
     let title = format!(
-        " Network — {} app{} · {sampled} ",
+        " Network — {} app{} · {sampled}{hint} ",
         apps.len(),
         if apps.len() == 1 { "" } else { "s" },
     );
@@ -1829,11 +2339,14 @@ fn draw_app_list(f: &mut Frame, state: &NetworkState, area: Rect) {
         .style(Style::reset())
         .title(title);
     let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2);
 
     let mut lines: Vec<Line<'static>> = vec![Line::from("")];
+    // (start_line, height) of the selected card, for scroll-into-view.
+    let mut selected_extent: Option<(u16, u16)> = None;
     if state.last_sample_at.is_none() {
         lines.push(Line::from(Span::styled(
-            "  gathering first samples … (nettop takes ~4s to prime)",
+            "  gathering first samples …",
             Style::default().fg(Color::DarkGray),
         )));
     } else if apps.is_empty() {
@@ -1846,11 +2359,23 @@ fn draw_app_list(f: &mut Frame, state: &NetworkState, area: Rect) {
         // total) so the bars always add up to a full 100%.
         let total_bps: f64 = apps.iter().map(|a| a.total_ema_bps()).sum();
         for stat in apps {
-            append_app_card(&mut lines, stat, state, inner_width, total_bps);
+            let selected =
+                focused && app.net_selected.as_deref() == Some(stat.name.as_str());
+            let start = lines.len() as u16;
+            append_app_card(&mut lines, stat, state, inner_width, total_bps, selected);
             lines.push(Line::from(""));
+            if selected {
+                selected_extent = Some((start, lines.len() as u16 - start));
+            }
         }
     }
-    let para = Paragraph::new(lines).style(Style::reset()).block(block);
+
+    let scroll = scroll_into_view(&app.net_scroll, selected_extent, lines.len() as u16, inner_height);
+
+    let para = Paragraph::new(lines)
+        .style(Style::reset())
+        .scroll((scroll, 0))
+        .block(block);
     f.render_widget(para, area);
 }
 
@@ -1862,6 +2387,7 @@ fn append_app_card(
     state: &NetworkState,
     inner_width: usize,
     total_bps: f64,
+    selected: bool,
 ) {
     let accent = app_accent(&stat.name);
     let idle_secs = stat.last_active.elapsed().as_secs();
@@ -1896,8 +2422,14 @@ fn append_app_card(
     let fixed = 4 + NET_NAME_COL + 1 + bar_cells + 2 + NET_RATES_COL + 2;
     let spark_w = inner_width.saturating_sub(fixed).max(6);
 
+    // Selected card gets the same "▶" cursor the git pane uses.
+    let marker: Span<'static> = if selected {
+        Span::styled("▶ ", Style::default().fg(Color::Cyan))
+    } else {
+        Span::raw("  ")
+    };
     let mut spans: Vec<Span<'static>> = vec![
-        Span::raw("  "),
+        marker,
         Span::styled(bullet.to_string(), bullet_style),
         Span::raw(" "),
         Span::styled(name_display, name_style),
@@ -2060,5 +2592,1010 @@ fn build_sparkline(history: &std::collections::VecDeque<u32>, width: usize) -> S
         }
     }
     out
+}
+
+// -------------------- processes tab --------------------
+
+// Fixed column widths, same role as the NET_* counterparts.
+const PROC_NAME_COL: usize = 20;
+// "cpu 999.9%  mem 63.9 GB" — two labels + two right-aligned values.
+const PROC_STATS_COL: usize = 23;
+
+// Intensity ramps for the header charts (dim → bright): amber for CPU,
+// violet for memory — distinct from the network tab's green/cyan.
+const CPU_RAMP: [Color; 3] = [
+    Color::Rgb(133, 77, 14),
+    Color::Rgb(202, 138, 4),
+    Color::Rgb(250, 204, 21),
+];
+const MEM_RAMP: [Color; 3] = [
+    Color::Rgb(76, 29, 149),
+    Color::Rgb(124, 58, 237),
+    Color::Rgb(167, 139, 250),
+];
+
+// bytes → human-readable, binary divisors (matching how Activity Monitor
+// and htop report memory, unlike the decimal convention for throughput).
+fn format_mem(bytes: u64) -> String {
+    const K: f64 = 1024.0;
+    let b = bytes as f64;
+    if b < K * K {
+        format!("{:.0} KB", b / K)
+    } else if b < K * K * K {
+        format!("{:.0} MB", b / (K * K))
+    } else {
+        format!("{:.1} GB", b / (K * K * K))
+    }
+}
+
+// "cpu 12.3%  mem 1.2 GB" as styled spans, right-aligned into fixed
+// columns so every row's numbers line up vertically.
+fn proc_stat_spans(cpu: f64, mem: u64, dim: bool) -> Vec<Span<'static>> {
+    let (cpu_style, mem_style) = if dim {
+        (
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        (
+            Style::default().fg(CPU_RAMP[2]),
+            Style::default().fg(MEM_RAMP[2]),
+        )
+    };
+    vec![
+        Span::styled(format!("cpu {:>6}", format!("{cpu:.1}%")), cpu_style),
+        Span::raw("  "),
+        Span::styled(format!("mem {:>7}", format_mem(mem)), mem_style),
+    ]
+}
+
+fn draw_processes(f: &mut Frame, app: &App, area: Rect) {
+    let state = &app.proc_state;
+
+    // Detail view replaces the whole tab body while open.
+    if let Some(name) = &app.proc_detail {
+        if let Some(stat) = state.apps.get(name) {
+            draw_proc_detail(f, stat, area);
+            return;
+        }
+    }
+
+    // Header: side-by-side CPU/memory charts, then the per-application
+    // list underneath — the same skeleton as the network tab.
+    let zones = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Min(0)])
+        .split(area);
+    let halves = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(zones[0]);
+
+    let cpu_title = Line::from(vec![
+        Span::styled(
+            format!(" cpu {:.1}% ", state.ema_cpu_total),
+            Style::default().fg(CPU_RAMP[2]).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{} cores · load {:.2} ", state.core_count, state.load_avg),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    // Pinned to a 0–100% scale so the chart height means absolute load,
+    // unlike the peak-normalized network charts.
+    draw_chart_block(f, halves[0], cpu_title, &state.history_cpu, &CPU_RAMP, Some(1000));
+
+    let mem_title = Line::from(vec![
+        Span::styled(
+            format!(" mem {} ", format_mem(state.mem_used)),
+            Style::default().fg(MEM_RAMP[2]).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("of {} ", format_mem(state.mem_total)),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    let mem_max = (state.mem_total / (1024 * 1024)).max(1) as u32;
+    draw_chart_block(f, halves[1], mem_title, &state.history_mem, &MEM_RAMP, Some(mem_max));
+
+    draw_proc_list(f, app, zones[1]);
+}
+
+fn draw_proc_list(f: &mut Frame, app: &App, area: Rect) {
+    let state = &app.proc_state;
+    let apps = state.visible_apps();
+    let focused = app.focus == Focus::Right;
+    let sampled = state
+        .last_sample_at
+        .map(|t| format!("sampled {}s ago", (t.elapsed().as_secs() / 2) * 2))
+        .unwrap_or_else(|| "waiting for first sample".to_string());
+    let hint = if focused {
+        " (↑/↓ select · Enter details)"
+    } else {
+        ""
+    };
+    let title = format!(
+        " Processes — {} of {} apps · {} procs · {sampled}{hint} ",
+        apps.len(),
+        state.apps.len(),
+        state.total_proc_count(),
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .style(Style::reset())
+        .title(title);
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2);
+
+    let mut lines: Vec<Line<'static>> = vec![Line::from("")];
+    // (start_line, height) of the selected card, for scroll-into-view.
+    let mut selected_extent: Option<(u16, u16)> = None;
+    if state.last_sample_at.is_none() {
+        lines.push(Line::from(Span::styled(
+            "  gathering first samples …",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else if apps.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  nothing above the activity threshold.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        // Shares are relative to the sum over listed apps so the bars
+        // always add up to a full 100%.
+        let total_cpu: f64 = apps.iter().map(|a| a.ema_cpu).sum();
+        for stat in apps {
+            let selected =
+                focused && app.proc_selected.as_deref() == Some(stat.name.as_str());
+            let start = lines.len() as u16;
+            append_proc_card(&mut lines, stat, inner_width, total_cpu, selected);
+            lines.push(Line::from(""));
+            if selected {
+                selected_extent = Some((start, lines.len() as u16 - start));
+            }
+        }
+    }
+
+    let scroll = scroll_into_view(&app.proc_scroll, selected_extent, lines.len() as u16, inner_height);
+
+    let para = Paragraph::new(lines)
+        .style(Style::reset())
+        .scroll((scroll, 0))
+        .block(block);
+    f.render_widget(para, area);
+}
+
+// One application "card": headline row (accent-colored name · share-of-CPU
+// bar · sparkline · cpu/mem) plus its busiest member processes nested
+// underneath — the processes-tab analog of append_app_card.
+fn append_proc_card(
+    lines: &mut Vec<Line<'static>>,
+    stat: &processes::AppStat,
+    inner_width: usize,
+    total_cpu: f64,
+    selected: bool,
+) {
+    let accent = app_accent(&stat.name);
+    let idle_secs = stat.last_active.elapsed().as_secs();
+    let dim = idle_secs >= 30;
+    let bullet = if idle_secs < 4 {
+        "●"
+    } else if idle_secs < 30 {
+        "○"
+    } else {
+        "·"
+    };
+    let bullet_style = if dim {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(accent)
+    };
+
+    let name_display = truncate(&stat.name, PROC_NAME_COL);
+    let name_pad = PROC_NAME_COL.saturating_sub(name_display.chars().count());
+    let name_style = if dim {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(accent).add_modifier(Modifier::BOLD)
+    };
+
+    // Drop the share bar on narrow terminals rather than squeezing the
+    // sparkline out of existence.
+    let show_bar = inner_width >= 82;
+    let bar_cells = if show_bar { NET_BAR_W + 6 } else { 0 };
+    let fixed = 4 + PROC_NAME_COL + 1 + bar_cells + 2 + PROC_STATS_COL + 2;
+    let spark_w = inner_width.saturating_sub(fixed).max(6);
+
+    let marker: Span<'static> = if selected {
+        Span::styled("▶ ", Style::default().fg(Color::Cyan))
+    } else {
+        Span::raw("  ")
+    };
+    let mut spans: Vec<Span<'static>> = vec![
+        marker,
+        Span::styled(bullet.to_string(), bullet_style),
+        Span::raw(" "),
+        Span::styled(name_display, name_style),
+        Span::raw(" ".repeat(name_pad + 1)),
+    ];
+
+    if show_bar {
+        let share = if total_cpu > 0.0 {
+            stat.ema_cpu / total_cpu
+        } else {
+            0.0
+        };
+        let filled = ((share * NET_BAR_W as f64).round() as usize).min(NET_BAR_W);
+        let bar_color = if dim { Color::DarkGray } else { accent };
+        spans.push(Span::styled(
+            "▰".repeat(filled),
+            Style::default().fg(bar_color),
+        ));
+        spans.push(Span::styled(
+            "▱".repeat(NET_BAR_W - filled),
+            Style::default().fg(Color::Rgb(60, 66, 74)),
+        ));
+        spans.push(Span::styled(
+            format!(" {:>3.0}%", share * 100.0),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::raw(" "));
+    }
+
+    let spark_style = if dim {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(accent)
+    };
+    spans.push(Span::styled(
+        build_sparkline(&stat.history, spark_w),
+        spark_style,
+    ));
+    spans.push(Span::raw("  "));
+    spans.extend(proc_stat_spans(stat.ema_cpu, stat.mem, dim));
+    lines.push(Line::from(spans));
+
+    // Busiest member processes, nested as a dim tree so the card reads
+    // "app → what it's made of" at a glance.
+    let top: Vec<&ProcInfo> = stat.procs.iter().take(3).collect();
+    let extra = stat.procs.len().saturating_sub(top.len());
+    // Sized so the member rows' stat columns land on the same right edge
+    // as the app row above: 4 indent + 3 connector + name + 1 + 11 pid +
+    // 2 + stats + 2 margin.
+    let member_name_w = inner_width
+        .saturating_sub(4 + 3 + 1 + 11 + 2 + PROC_STATS_COL + 2)
+        .max(10);
+    let tree_style = Style::default().fg(Color::DarkGray);
+    for (i, p) in top.iter().enumerate() {
+        let is_last = i == top.len() - 1 && extra == 0;
+        let connector = if is_last { "└─ " } else { "├─ " };
+        let member_display = truncate(&p.name, member_name_w);
+        let member_pad = member_name_w.saturating_sub(member_display.chars().count());
+        let member_dim = dim || p.cpu < 0.1;
+        let mut member_spans: Vec<Span<'static>> = vec![
+            Span::raw("    "),
+            Span::styled(connector.to_string(), tree_style),
+            Span::styled(member_display, Style::default().fg(Color::Gray)),
+            Span::raw(" ".repeat(member_pad + 1)),
+            Span::styled(
+                format!("{:>11}", format!("pid {}", p.pid)),
+                tree_style,
+            ),
+            Span::raw("  "),
+        ];
+        member_spans.extend(proc_stat_spans(p.cpu as f64, p.mem, member_dim));
+        lines.push(Line::from(member_spans));
+    }
+    if extra > 0 {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                format!(
+                    "└─ … {extra} more process{}",
+                    if extra == 1 { "" } else { "es" },
+                ),
+                tree_style,
+            ),
+        ]));
+    }
+}
+
+// Full-tab detail view for one app: tall CPU/memory history charts
+// (8 minutes of samples) and the complete member-process table.
+fn draw_proc_detail(f: &mut Frame, stat: &processes::AppStat, area: Rect) {
+    let accent = app_accent(&stat.name);
+    let zones = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    let peak_cpu = stat.history_cpu.iter().copied().max().unwrap_or(0) as f64 / 10.0;
+    let cpu_title = Line::from(vec![
+        Span::styled(
+            format!(" ● {} ", stat.name),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("· cpu {:.1}% ", stat.ema_cpu),
+            Style::default().fg(CPU_RAMP[2]).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("peak {peak_cpu:.1}% "),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    draw_chart_block(f, zones[0], cpu_title, &stat.history_cpu, &CPU_RAMP, None);
+
+    let peak_mem = stat.history_mem.iter().copied().max().unwrap_or(0) as u64 * 1024 * 1024;
+    let mem_title = Line::from(vec![
+        Span::styled(
+            format!(" mem {} ", format_mem(stat.mem)),
+            Style::default().fg(MEM_RAMP[2]).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("peak {} ", format_mem(peak_mem)),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    draw_chart_block(f, zones[1], mem_title, &stat.history_mem, &MEM_RAMP, None);
+
+    draw_detail_procs(f, stat, zones[2]);
+}
+
+// Every member process of the app, busiest first: activity bullet, name,
+// share-of-app-CPU bar, pid, and cpu/mem — the processes-tab analog of
+// draw_detail_hosts.
+fn draw_detail_procs(f: &mut Frame, stat: &processes::AppStat, area: Rect) {
+    let accent = app_accent(&stat.name);
+    let procs = &stat.procs;
+    let title = format!(
+        " Processes — {} proc{} · Esc to close ",
+        procs.len(),
+        if procs.len() == 1 { "" } else { "s" },
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .style(Style::reset())
+        .title(title);
+    let inner_width = area.width.saturating_sub(2) as usize;
+
+    // 4 indent+bullet · name · 1 · bar 10 · pct 5 · 2 · pid 11 · 2 ·
+    // stats · 2 margin — same right-edge alignment as the list view.
+    let name_w = inner_width
+        .saturating_sub(4 + 1 + NET_BAR_W + 5 + 2 + 11 + 2 + PROC_STATS_COL + 2)
+        .max(10);
+    let app_cpu: f64 = procs.iter().map(|p| p.cpu as f64).sum();
+
+    let mut lines: Vec<Line<'static>> = vec![Line::from("")];
+    for p in procs {
+        let dim = p.cpu < 0.1;
+        let bullet = if p.cpu >= 0.5 {
+            "●"
+        } else if p.cpu > 0.0 {
+            "○"
+        } else {
+            "·"
+        };
+        let bullet_style = if dim {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(accent)
+        };
+        let name_display = truncate(&p.name, name_w);
+        let name_pad = name_w.saturating_sub(name_display.chars().count());
+        let name_style = if dim {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        let share = if app_cpu > 0.0 {
+            p.cpu as f64 / app_cpu
+        } else {
+            0.0
+        };
+        let filled = ((share * NET_BAR_W as f64).round() as usize).min(NET_BAR_W);
+        let bar_color = if dim { Color::DarkGray } else { accent };
+
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::raw("  "),
+            Span::styled(bullet.to_string(), bullet_style),
+            Span::raw(" "),
+            Span::styled(name_display, name_style),
+            Span::raw(" ".repeat(name_pad + 1)),
+            Span::styled("▰".repeat(filled), Style::default().fg(bar_color)),
+            Span::styled(
+                "▱".repeat(NET_BAR_W - filled),
+                Style::default().fg(Color::Rgb(60, 66, 74)),
+            ),
+            Span::styled(
+                format!(" {:>3.0}%", share * 100.0),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:>11}", format!("pid {}", p.pid)),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw("  "),
+        ];
+        spans.extend(proc_stat_spans(p.cpu as f64, p.mem, dim));
+        lines.push(Line::from(spans));
+    }
+
+    let para = Paragraph::new(lines).style(Style::reset()).block(block);
+    f.render_widget(para, area);
+}
+
+// -------------------- disk / power tab --------------------
+
+// Intensity ramps (dim → bright): blue for disk reads, magenta for
+// writes. Battery flow reuses DOWN_RAMP (green) for charging and
+// CPU_RAMP (amber) for draining.
+const READ_RAMP: [Color; 3] = [
+    Color::Rgb(30, 64, 175),
+    Color::Rgb(59, 130, 246),
+    Color::Rgb(147, 197, 253),
+];
+const WRITE_RAMP: [Color; 3] = [
+    Color::Rgb(157, 23, 77),
+    Color::Rgb(219, 39, 119),
+    Color::Rgb(244, 114, 182),
+];
+
+// Volume fill bar width — wider than the share bars because it's the
+// row's centerpiece rather than an annotation.
+const VOL_BAR_W: usize = 24;
+// Charge/health gauge width in the battery panel.
+const PWR_GAUGE_W: usize = 16;
+
+fn draw_disk_power(f: &mut Frame, app: &App, area: Rect) {
+    let state = &app.hw_state;
+
+    // Volumes block sizes to its content; the power panel takes the rest.
+    let total_vols = state.volumes.len() + state.unmounted.len();
+    let shown_vols = total_vols.min(8);
+    let extra_vols = total_vols - shown_vols;
+    let vol_h = (shown_vols + extra_vols.min(1)) as u16 + 3;
+    let zones = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Length(vol_h.max(4)),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    let halves = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(zones[0]);
+
+    let read_title = disk_chart_title(
+        "read",
+        state.ema_read_bps,
+        &state.history_read,
+        state.read_iops,
+        state.read_lat_ms,
+        READ_RAMP[2],
+    );
+    draw_chart_block(f, halves[0], read_title, &state.history_read, &READ_RAMP, None);
+    let write_title = disk_chart_title(
+        "write",
+        state.ema_write_bps,
+        &state.history_write,
+        state.write_iops,
+        state.write_lat_ms,
+        WRITE_RAMP[2],
+    );
+    draw_chart_block(f, halves[1], write_title, &state.history_write, &WRITE_RAMP, None);
+
+    draw_volumes(f, state, zones[1]);
+    draw_power(f, state, zones[2]);
+}
+
+// " read 12.3 MB/s · peak 80 MB/s · 450 iops · 0.6 ms" as a chart title.
+fn disk_chart_title(
+    label: &str,
+    ema_bps: f64,
+    history: &std::collections::VecDeque<u32>,
+    iops: f64,
+    lat_ms: f64,
+    accent: Color,
+) -> Line<'static> {
+    let peak = history.iter().copied().max().unwrap_or(0) as f64;
+    Line::from(vec![
+        Span::styled(
+            format!(" {label} {} ", format_bps(ema_bps)),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("peak {} · {:.0} iops · {:.1} ms ", format_bps(peak), iops, lat_ms),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+fn draw_volumes(f: &mut Frame, state: &HardwareState, area: Rect) {
+    let unmounted_part = if state.unmounted.is_empty() {
+        String::new()
+    } else {
+        format!(" · {} unmounted", state.unmounted.len())
+    };
+    let title = format!(
+        " Volumes — {} mounted{unmounted_part} ",
+        state.volumes.len(),
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .style(Style::reset())
+        .title(title);
+    let inner_width = area.width.saturating_sub(2) as usize;
+
+    let mut lines: Vec<Line<'static>> = vec![Line::from("")];
+    if state.volumes.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  waiting for first sample …",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let shown = state.volumes.len().min(6);
+    for vol in state.volumes.iter().take(shown) {
+        let frac = vol.fill_frac();
+        // Fill color grades with fullness: comfortable → tight → critical.
+        let bar_color = if frac < 0.70 {
+            DOWN_RAMP[1]
+        } else if frac < 0.90 {
+            CPU_RAMP[1]
+        } else {
+            Color::Rgb(248, 81, 73)
+        };
+        let filled = ((frac * VOL_BAR_W as f64).round() as usize).min(VOL_BAR_W);
+        let name_display = truncate(&vol.name, PROC_NAME_COL);
+        let name_pad = PROC_NAME_COL.saturating_sub(name_display.chars().count());
+        let sizes = format!(
+            "{:>8} of {:>8}",
+            format_mem(vol.used()),
+            format_mem(vol.total),
+        );
+        let tag = if vol.removable { "  ⏏ external" } else { "" };
+        // Mount path fills whatever is left, dimmed, so rows stay tidy.
+        let used_cols =
+            2 + PROC_NAME_COL + 1 + VOL_BAR_W + 5 + 2 + sizes.chars().count() + tag.chars().count() + 2;
+        let mount_w = inner_width.saturating_sub(used_cols + 2);
+        let mount = truncate(&vol.mount, mount_w);
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::raw("  "),
+            Span::styled(
+                name_display,
+                Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" ".repeat(name_pad + 1)),
+            Span::styled("▰".repeat(filled), Style::default().fg(bar_color)),
+            Span::styled(
+                "▱".repeat(VOL_BAR_W - filled),
+                Style::default().fg(Color::Rgb(60, 66, 74)),
+            ),
+            Span::styled(
+                format!(" {:>3.0}%", frac * 100.0),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw("  "),
+            Span::styled(sizes, Style::default().fg(Color::Gray)),
+        ];
+        if !tag.is_empty() {
+            spans.push(Span::styled(
+                tag.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        if !mount.is_empty() {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(mount, Style::default().fg(Color::DarkGray)));
+        }
+        lines.push(Line::from(spans));
+    }
+    // Unmounted partitions, dimmed: no usage data exists inside them, so
+    // the row shows what they are and how much disk they occupy.
+    let unmounted_shown = state.unmounted.len().min(8_usize.saturating_sub(shown));
+    for vol in state.unmounted.iter().take(unmounted_shown) {
+        let name_display = truncate(&vol.name, PROC_NAME_COL);
+        let name_pad = PROC_NAME_COL.saturating_sub(name_display.chars().count());
+        // "not mounted" sits where mounted rows put their fill bar; the
+        // size right-aligns to the same column as "X of Y".
+        let bar_slot = format!("{:<w$}", "not mounted", w = VOL_BAR_W + 5);
+        let sizes = format!("{:>20}", format_mem(vol.size));
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::raw("  "),
+            Span::styled(name_display, Style::default().fg(Color::DarkGray)),
+            Span::raw(" ".repeat(name_pad + 1)),
+            Span::styled(bar_slot, Style::default().fg(Color::Rgb(60, 66, 74))),
+            Span::raw("  "),
+            Span::styled(sizes, Style::default().fg(Color::DarkGray)),
+            Span::raw("  "),
+            Span::styled(
+                format!("{} · {}", vol.device, vol.kind),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+        let width_used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        if width_used > inner_width {
+            spans.truncate(6); // drop the device/kind tag on narrow terminals
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let extra = (state.volumes.len() + state.unmounted.len())
+        .saturating_sub(shown + unmounted_shown);
+    if extra > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  … {extra} more volume{}", if extra == 1 { "" } else { "s" }),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let para = Paragraph::new(lines).style(Style::reset()).block(block);
+    f.render_widget(para, area);
+}
+
+fn draw_power(f: &mut Frame, state: &HardwareState, area: Rect) {
+    let Some(bat) = &state.battery else {
+        // Desktop Mac (or first sample pending): no battery telemetry.
+        let msg = if state.last_sample_at.is_none() {
+            "waiting for first sample …"
+        } else {
+            "no battery detected — power telemetry needs a portable Mac."
+        };
+        let para = Paragraph::new(Line::from(Span::styled(
+            format!("  {msg}"),
+            Style::default().fg(Color::DarkGray),
+        )))
+        .style(Style::reset())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .style(Style::reset())
+                .title(" Power "),
+        );
+        f.render_widget(para, area);
+        return;
+    };
+
+    // Battery-flow chart on the left, detail panel on the right. The
+    // panel is fixed-width prose; the chart soaks up the rest.
+    let panel_w: u16 = 52;
+    let halves = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(20), Constraint::Length(panel_w)])
+        .split(area);
+
+    draw_battery_flow(f, state, bat, halves[0]);
+    draw_battery_panel(f, bat, halves[1]);
+}
+
+// Signed battery-flow chart, drawn as a braille line: amber while
+// draining, green while charging, hugging the bottom when idle. Sign is
+// carried by color; the line's height is the magnitude in watts against
+// a round-number scale.
+fn draw_battery_flow(f: &mut Frame, state: &HardwareState, bat: &BatterySnapshot, area: Rect) {
+    let drain_peak = state.history_watts.iter().copied().min().unwrap_or(0).min(0).unsigned_abs();
+    let charge_peak = state.history_watts.iter().copied().max().unwrap_or(0).max(0) as u32;
+    // Round the chart ceiling up to a clean number so a steady draw sits
+    // at a stable, readable height instead of pinning to the top edge
+    // (peak-normalized, a constant 8 W would render as a line glued to
+    // the ceiling that rescales on every blip).
+    let scale = nice_ceil(drain_peak.max(charge_peak).max(10));
+
+    let (flow_desc, flow_color) = if state.ema_watts < -0.05 {
+        (format!("{:.1} W out", -state.ema_watts), CPU_RAMP[2])
+    } else if state.ema_watts > 0.05 {
+        (format!("{:.1} W in", state.ema_watts), DOWN_RAMP[2])
+    } else if bat.external_connected {
+        ("idle · on AC".to_string(), Color::DarkGray)
+    } else {
+        ("idle".to_string(), Color::DarkGray)
+    };
+    let mut title_spans = vec![Span::styled(
+        format!(" battery flow · {flow_desc} "),
+        Style::default().fg(flow_color).add_modifier(Modifier::BOLD),
+    )];
+    if state.history_watts.iter().any(|w| *w != 0) {
+        title_spans.push(Span::styled(
+            format!(
+                "drain peak {:.1} W · charge peak {:.1} W · top {:.0} W ",
+                drain_peak as f64 / 10.0,
+                charge_peak as f64 / 10.0,
+                scale as f64 / 10.0,
+            ),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .style(Style::reset())
+        .title(Line::from(title_spans));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let lines = render_flow_line(
+        &state.history_watts,
+        inner.width as usize,
+        inner.height as usize,
+        scale,
+    );
+    f.render_widget(Paragraph::new(lines).style(Style::reset()), inner);
+}
+
+// Smallest 1/2/5 × 10^k that covers `x` — a chart ceiling that only
+// moves when the data genuinely outgrows it.
+fn nice_ceil(x: u32) -> u32 {
+    let mut m: u32 = 1;
+    loop {
+        for step in [1, 2, 5] {
+            let candidate = m.saturating_mul(step);
+            if candidate >= x {
+                return candidate;
+            }
+        }
+        m = m.saturating_mul(10);
+    }
+}
+
+// Plot a signed history as a connected line on a braille canvas (2×4
+// dots per cell). Magnitude sets the height; sign sets the color (green
+// charge / amber drain, dim gray at zero). Vertical jumps between
+// neighbouring samples are filled in so the line reads as continuous.
+fn render_flow_line(
+    history: &std::collections::VecDeque<i32>,
+    width: usize,
+    rows: usize,
+    scale: u32,
+) -> Vec<Line<'static>> {
+    let w_dots = width * 2;
+    let h_dots = rows * 4;
+    let skip = history.len().saturating_sub(w_dots);
+    let vals: Vec<i32> = history.iter().skip(skip).copied().collect();
+    // Newest sample at the right edge; short histories grow in from it.
+    let pad_dots = w_dots - vals.len();
+    let scale = scale.max(1);
+
+    // Braille dot bit for (dx, dy) within a cell, per the Unicode layout.
+    const DOT_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
+    let mut bits = vec![vec![0u8; width]; rows];
+    let mut cell_colors = vec![vec![None::<Color>; width]; rows];
+    let mut set_dot = |x: usize, y: usize, color: Color| {
+        let (cx, cy) = (x / 2, y / 4);
+        if cx < width && cy < rows {
+            bits[cy][cx] |= DOT_BITS[x % 2][y % 4];
+            cell_colors[cy][cx] = Some(color);
+        }
+    };
+
+    let mut prev_y: Option<usize> = None;
+    for (i, &v) in vals.iter().enumerate() {
+        let x = pad_dots + i;
+        let ratio = (v.unsigned_abs() as f64 / scale as f64).min(1.0);
+        let y = (h_dots - 1) - ((ratio * (h_dots - 1) as f64).round() as usize).min(h_dots - 1);
+        let color = if v > 0 {
+            DOWN_RAMP[2]
+        } else if v < 0 {
+            CPU_RAMP[2]
+        } else {
+            Color::DarkGray
+        };
+        // Connect to the previous sample's height so steps read as a line.
+        let (lo, hi) = match prev_y {
+            Some(p) => (y.min(p), y.max(p)),
+            None => (y, y),
+        };
+        for yy in lo..=hi {
+            set_dot(x, yy, color);
+        }
+        prev_y = Some(y);
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows);
+    for cy in 0..rows {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(width);
+        for cx in 0..width {
+            let b = bits[cy][cx];
+            if b == 0 {
+                spans.push(Span::raw(" "));
+            } else {
+                let ch = char::from_u32(0x2800 + b as u32).unwrap_or(' ');
+                let color = cell_colors[cy][cx].unwrap_or(Color::DarkGray);
+                spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+// The gold-plated battery panel: everything interesting the SMC will
+// tell us without root, as label/value rows.
+fn draw_battery_panel(f: &mut Frame, bat: &BatterySnapshot, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .style(Style::reset())
+        .title(" Battery ");
+
+    let label = |s: &str| Span::styled(format!("  {s:<9}"), Style::default().fg(Color::DarkGray));
+    let value = |s: String| Span::styled(s, Style::default().fg(Color::Gray));
+    let gauge = |frac: f64, color: Color| -> Vec<Span<'static>> {
+        let filled = ((frac * PWR_GAUGE_W as f64).round() as usize).min(PWR_GAUGE_W);
+        vec![
+            Span::styled("▰".repeat(filled), Style::default().fg(color)),
+            Span::styled(
+                "▱".repeat(PWR_GAUGE_W - filled),
+                Style::default().fg(Color::Rgb(60, 66, 74)),
+            ),
+        ]
+    };
+
+    let mut lines: Vec<Line<'static>> = vec![Line::from("")];
+
+    // State: what the battery is doing right now, plus the time estimate
+    // that goes with it.
+    let state_desc = if bat.is_charging {
+        let eta = bat
+            .time_to_full_min
+            .map(|m| format!(" · {} to full", format_minutes(m)))
+            .unwrap_or_default();
+        format!("charging{eta}")
+    } else if !bat.external_connected {
+        let eta = bat
+            .time_to_empty_min
+            .map(|m| format!(" · {} left", format_minutes(m)))
+            .unwrap_or_default();
+        format!("discharging{eta}")
+    } else if bat.fully_charged {
+        "charged · on AC".to_string()
+    } else {
+        "on AC · not charging".to_string()
+    };
+    lines.push(Line::from(vec![label("state"), value(state_desc)]));
+
+    // Adapter: negotiated USB-PD contract + every profile it offered.
+    match &bat.adapter {
+        Some(a) => {
+            let kind = if a.is_wireless { "wireless" } else { "USB-C" };
+            lines.push(Line::from(vec![
+                label("adapter"),
+                value(format!(
+                    "{} W {kind} · {:.0} V × {:.1} A",
+                    a.watts,
+                    a.voltage_mv as f64 / 1000.0,
+                    a.current_ma as f64 / 1000.0,
+                )),
+            ]));
+            if !a.profile_volts.is_empty() {
+                let profiles = a
+                    .profile_volts
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                lines.push(Line::from(vec![
+                    label(""),
+                    Span::styled(
+                        format!("PD profiles {profiles} V"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
+        None => lines.push(Line::from(vec![
+            label("adapter"),
+            Span::styled("none · on battery", Style::default().fg(Color::DarkGray)),
+        ])),
+    }
+
+    // Charge now, in both percent and real mAh.
+    let mut charge_spans = vec![label("charge")];
+    charge_spans.extend(gauge(bat.percent as f64 / 100.0, DOWN_RAMP[1]));
+    charge_spans.push(value(format!(
+        " {}% · {} mAh",
+        bat.percent, bat.current_capacity_mah,
+    )));
+    lines.push(Line::from(charge_spans));
+
+    // Health: what a full charge holds today vs the design spec.
+    let health = bat.health_percent();
+    let health_color = if health >= 80.0 {
+        DOWN_RAMP[1]
+    } else if health >= 60.0 {
+        CPU_RAMP[1]
+    } else {
+        Color::Rgb(248, 81, 73)
+    };
+    let mut health_spans = vec![label("health")];
+    health_spans.extend(gauge(health / 100.0, health_color));
+    health_spans.push(value(format!(
+        " {health:.0}% · {} of {} mAh",
+        bat.max_capacity_mah, bat.design_capacity_mah,
+    )));
+    lines.push(Line::from(health_spans));
+
+    lines.push(Line::from(vec![
+        label("cycles"),
+        value(format!("{}", bat.cycle_count)),
+    ]));
+
+    // Pack electricals: live voltage/current and per-cell voltages.
+    lines.push(Line::from(vec![
+        label("pack"),
+        value(format!(
+            "{:.3} V · {:+.3} A",
+            bat.voltage_mv as f64 / 1000.0,
+            bat.amperage_ma as f64 / 1000.0,
+        )),
+    ]));
+    if !bat.cell_voltages_mv.is_empty() {
+        let cells = bat
+            .cell_voltages_mv
+            .iter()
+            .map(|mv| format!("{:.3}", *mv as f64 / 1000.0))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let spread = bat.cell_voltages_mv.iter().max().unwrap_or(&0)
+            - bat.cell_voltages_mv.iter().min().unwrap_or(&0);
+        lines.push(Line::from(vec![
+            label("cells"),
+            value(format!("{cells} V")),
+            Span::styled(
+                format!("  Δ {spread} mV"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
+    // Temperature now + the extremes the pack has ever logged.
+    let mut temp_line = vec![label("temp"), value(format!("{:.1}°C", bat.temperature_c))];
+    if let (Some(lo), Some(hi)) = (bat.lifetime_temp_min_c, bat.lifetime_temp_max_c) {
+        temp_line.push(Span::styled(
+            format!("  · lifetime {lo}–{hi}°C"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    lines.push(Line::from(temp_line));
+
+    // Today's state-of-charge window, from the gauge's daily log.
+    if let (Some(lo), Some(hi)) = (bat.daily_min_soc, bat.daily_max_soc) {
+        lines.push(Line::from(vec![
+            label("today"),
+            value(format!("cycled between {lo}% and {hi}%")),
+        ]));
+    }
+
+    let para = Paragraph::new(lines).style(Style::reset()).block(block);
+    f.render_widget(para, area);
+}
+
+// Minutes → "2h 14m" / "45m".
+fn format_minutes(min: i64) -> String {
+    if min >= 60 {
+        format!("{}h {:02}m", min / 60, min % 60)
+    } else {
+        format!("{min}m")
+    }
 }
 

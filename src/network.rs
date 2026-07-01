@@ -1,9 +1,12 @@
 //! Per-application bandwidth monitor built on top of macOS' `nettop`.
 //!
-//! `nettop -d` gives us per-interval deltas (rather than cumulative
-//! counters), which sidesteps a class of tracking bugs — we just parse and
-//! forward. `-n` keeps hostname resolution off so a mid-stream `IP → name`
-//! rewrite doesn't split a single connection across two aggregation keys.
+//! We run `nettop -L 1` as a ~10ms one-shot every sample interval and
+//! diff its cumulative per-connection counters ourselves. A long-running
+//! `nettop -L 0`/`-l 0` would hand us ready-made deltas, but its logging
+//! mode busy-spins between samples (~140% CPU sustained, regardless of
+//! `-s`) — measured pathological, so we do the delta tracking instead.
+//! `-n` keeps hostname resolution off so an `IP → name` rewrite between
+//! samples doesn't split a connection across two aggregation keys.
 //!
 //! Traffic is grouped by *application* first (all `Google Chrome Helper`
 //! variants collapse into "Google Chrome", `plugin-container` joins
@@ -11,10 +14,8 @@
 //! app so the UI can show "who is this app talking to".
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
-use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -32,10 +33,6 @@ pub const HISTORY_LEN: usize = 30;
 pub const TOTAL_HISTORY_LEN: usize = 240;
 // An app with no traffic for this long is removed from state entirely.
 pub const REMOVE_AFTER_SECS: u64 = 120;
-
-// Sample delimiter: nettop -x -L reprints the column-name row between
-// each sample. We use that to detect boundaries.
-const HEADER_ROW: &str = ",bytes_in,bytes_out,";
 
 pub struct NetSample {
     pub interval: Duration,
@@ -66,9 +63,6 @@ pub struct HostDelta {
 
 pub struct Monitor {
     rx: Receiver<NetSample>,
-    // Owned so nettop is killed via Drop when the Monitor is dropped.
-    // Never read after construction — the field is here for its lifetime.
-    _child: ChildGuard,
 }
 
 impl Monitor {
@@ -77,187 +71,138 @@ impl Monitor {
     }
 }
 
-// RAII wrapper: kill nettop when the Monitor goes out of scope so a
-// panicking UI doesn't leave orphaned children behind. We spawn `script`
-// as a middleman (see `spawn_monitor` for why) so cleanup has to nuke
-// the whole process group — SIGKILL'ing `script` alone leaves `nettop`
-// orphaned since macOS doesn't reliably SIGHUP the pty slave.
-struct ChildGuard(Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let pid = self.0.id() as i32;
-        // `kill -TERM -pgid` (negative pid) targets the whole process
-        // group. Fall back to SIGKILL if TERM didn't take within 200ms.
-        // Shell out rather than pull in libc for a one-liner.
-        let _ = Command::new("kill")
-            .args(["-TERM", &format!("-{pid}")])
-            .stderr(Stdio::null())
-            .status();
-        thread::sleep(Duration::from_millis(200));
-        let _ = Command::new("kill")
-            .args(["-KILL", &format!("-{pid}")])
-            .stderr(Stdio::null())
-            .status();
-        let _ = self.0.wait();
+// One complete `-L 1` snapshot: header row, then process rows each
+// followed by their connection rows, with cumulative byte counters.
+fn run_nettop() -> Option<String> {
+    let out = Command::new("nettop")
+        .args(["-x", "-n", "-L", "1", "-J", "bytes_in,bytes_out", "-t", "external"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-// Returns None if nettop couldn't be spawned — caller falls back to
-// showing an error state instead of crashing.
+// Returns None if nettop couldn't run — caller falls back to showing an
+// error state instead of crashing. The probe doubles as the baseline
+// sample, so the app/connection inventory shows up immediately (with
+// zero rates) rather than after the first interval.
 pub fn spawn_monitor() -> Option<Monitor> {
-    // Nettop line-buffers on a tty but block-buffers on a pipe, so a
-    // straight `Stdio::piped()` reader would only see ~10s bursts. We
-    // wrap it in `script -q /dev/null` which gives it a pty — output
-    // then streams at the -s interval as advertised.
-    //
-    // process_group(0) puts the whole child chain in a fresh pgid so
-    // ChildGuard::drop can nuke script AND nettop with one kill(2) at
-    // shutdown.
-    let mut child = Command::new("script")
-        .args([
-            "-q", "/dev/null",
-            "nettop",
-            "-x", "-n", "-d",
-            "-L", "0",
-            "-s", &SAMPLE_INTERVAL.as_secs().to_string(),
-            "-J", "bytes_in,bytes_out",
-            "-t", "external",
-        ])
-        // Detach from the parent's stdin. If we inherit the parent's fd
-        // and the parent is a TUI (raw-mode tty), `script` gets confused
-        // trying to save/restore terminal attributes on a fd that's
-        // shared with a live curses app. /dev/null keeps it out of the
-        // way — script doesn't need to read anything anyway.
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .ok()?;
-
-    let stdout = child.stdout.take()?;
+    let first = run_nettop()?;
     let (tx, rx) = mpsc::channel();
-
     thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        let mut builder = SampleBuilder::new();
-        for line in reader.lines().map_while(Result::ok) {
-            // `contains` rather than `starts_with` because `script(1)`
-            // prepends a stray `^D` (and sometimes a couple of backspace
-            // chars) at stream start, and occasional control bytes can
-            // slip in from the pty.
-            if line.contains(HEADER_ROW) {
-                if let Some(sample) = builder.finish() {
-                    if tx.send(sample).is_err() {
-                        // Receiver dropped — the UI is going away.
-                        return;
-                    }
-                }
-                continue;
+        let mut tracker = DeltaTracker::new();
+        if tx.send(tracker.build_sample(&first)).is_err() {
+            return;
+        }
+        loop {
+            thread::sleep(SAMPLE_INTERVAL);
+            // A transient failure (e.g. fork pressure) skips one tick;
+            // the smoothing in NetworkState rides over the gap.
+            let Some(text) = run_nettop() else { continue };
+            if tx.send(tracker.build_sample(&text)).is_err() {
+                // Receiver dropped — the UI is going away.
+                return;
             }
-            builder.push_row(&line);
         }
     });
-
-    Some(Monitor {
-        rx,
-        _child: ChildGuard(child),
-    })
+    Some(Monitor { rx })
 }
 
-// Accumulates rows until a sample delimiter arrives. Data lives
-// *between* headers, so on the Nth header we're finishing the (N-1)th
-// sample:
-//   header #1 → nothing collected yet (return None)
-//   header #2 → sample #1 done — but that's the cumulative baseline, drop
-//   header #3+ → real delta sample, emit
-struct SampleBuilder {
-    apps: HashMap<String, AppDelta>,
-    total_in: u64,
-    total_out: u64,
-    // The canonical app a subsequent connection row belongs to. Nettop
-    // emits process rows followed by their connection children, so we
-    // remember whichever process we last saw.
-    current_app: Option<String>,
-    // Count of header rows seen so far. Cheap way to know "am I past the
-    // baseline sample" without extra boolean state.
-    headers_seen: u32,
+// Turns consecutive cumulative snapshots into per-interval deltas.
+//
+// nettop's counters are per-connection and count from the connection's
+// birth, so: a connection seen in the previous snapshot contributes
+// (current − previous); a connection first seen *after* our first
+// snapshot is genuinely new and its whole counter is this interval's
+// traffic; everything in the very first snapshot is pre-existing history
+// and contributes zero. A counter that went backwards means the 4-tuple
+// was reused by a fresh connection — treat like new.
+struct DeltaTracker {
+    // Cumulative (bytes_in, bytes_out) per connection from the previous
+    // snapshot, keyed by "<process label>|<connection descriptor>". The
+    // pid-bearing process label keeps two pids of one binary distinct.
+    prev: HashMap<String, (u64, u64)>,
+    // False only for the first snapshot, whose counters are all history.
+    primed: bool,
 }
 
-impl SampleBuilder {
+impl DeltaTracker {
     fn new() -> Self {
-        Self {
-            apps: HashMap::new(),
-            total_in: 0,
-            total_out: 0,
-            current_app: None,
-            headers_seen: 0,
-        }
+        Self { prev: HashMap::new(), primed: false }
     }
 
-    fn push_row(&mut self, line: &str) {
-        let Some(row) = parse_row(line) else { return };
-        match row {
-            Row::Process { name } => {
-                self.current_app = Some(canonical_app(name));
-            }
-            Row::Connection { remote_ip, bytes_in, bytes_out } => {
-                if is_ignorable(&remote_ip) {
-                    return;
+    fn build_sample(&mut self, text: &str) -> NetSample {
+        let mut apps: HashMap<String, AppDelta> = HashMap::new();
+        let mut total_in = 0u64;
+        let mut total_out = 0u64;
+        // Connection rows belong to the most recent process row above them.
+        let mut current_app: Option<String> = None;
+        let mut current_label = String::new();
+        let mut next: HashMap<String, (u64, u64)> = HashMap::new();
+
+        for line in text.lines() {
+            let Some(row) = parse_row(line) else { continue };
+            match row {
+                Row::Process { name, raw } => {
+                    current_app = Some(canonical_app(name));
+                    current_label = raw.to_string();
                 }
-                let app_name = self
-                    .current_app
-                    .clone()
-                    .unwrap_or_else(|| "(unknown)".to_string());
-                let app = self.apps.entry(app_name).or_default();
-                let host = app.hosts.entry(remote_ip).or_default();
-                // Idle connections still count toward conn totals so the
-                // UI can show "34 conns" even when most are quiet.
-                app.conn_count += 1;
-                host.conn_count += 1;
-                if bytes_in == 0 && bytes_out == 0 {
-                    return;
+                Row::Connection { label, remote_ip, bytes_in, bytes_out } => {
+                    if is_ignorable(&remote_ip) {
+                        continue;
+                    }
+                    let key = format!("{current_label}|{label}");
+                    let (d_in, d_out) = match self.prev.get(&key) {
+                        Some(&(p_in, p_out)) => {
+                            if bytes_in < p_in || bytes_out < p_out {
+                                // Reused 4-tuple: fresh connection.
+                                (bytes_in, bytes_out)
+                            } else {
+                                (bytes_in - p_in, bytes_out - p_out)
+                            }
+                        }
+                        None if self.primed => (bytes_in, bytes_out),
+                        None => (0, 0),
+                    };
+                    next.insert(key, (bytes_in, bytes_out));
+
+                    let app_name = current_app
+                        .clone()
+                        .unwrap_or_else(|| "(unknown)".to_string());
+                    let app = apps.entry(app_name).or_default();
+                    let host = app.hosts.entry(remote_ip).or_default();
+                    // Idle connections still count toward conn totals so
+                    // the UI can show "34 conns" even when most are quiet.
+                    app.conn_count += 1;
+                    host.conn_count += 1;
+                    if d_in == 0 && d_out == 0 {
+                        continue;
+                    }
+                    app.bytes_in += d_in;
+                    app.bytes_out += d_out;
+                    host.bytes_in += d_in;
+                    host.bytes_out += d_out;
+                    total_in += d_in;
+                    total_out += d_out;
                 }
-                app.bytes_in += bytes_in;
-                app.bytes_out += bytes_out;
-                host.bytes_in += bytes_in;
-                host.bytes_out += bytes_out;
-                self.total_in += bytes_in;
-                self.total_out += bytes_out;
             }
         }
-    }
 
-    fn finish(&mut self) -> Option<NetSample> {
-        // First header (#1): nothing collected yet, don't emit.
-        // Second header (#2): what was collected between #1 and #2 is
-        //   the cumulative baseline — drop it.
-        // Third+ (#3+): the data between successive headers is a real
-        //   delta sample; emit.
-        self.headers_seen += 1;
-        let out = if self.headers_seen >= 3 {
-            Some(NetSample {
-                interval: SAMPLE_INTERVAL,
-                apps: std::mem::take(&mut self.apps),
-                total_in: self.total_in,
-                total_out: self.total_out,
-            })
-        } else {
-            None
-        };
-        // Reset accumulators for the next sample.
-        self.apps = HashMap::new();
-        self.total_in = 0;
-        self.total_out = 0;
-        self.current_app = None;
-        out
+        // Connections that vanished this snapshot fall out of `prev`
+        // naturally; a later same-4-tuple connection is then "new".
+        self.prev = next;
+        self.primed = true;
+        NetSample { interval: SAMPLE_INTERVAL, apps, total_in, total_out }
     }
 }
 
 enum Row<'a> {
-    Process { name: &'a str },
-    Connection { remote_ip: IpAddr, bytes_in: u64, bytes_out: u64 },
+    Process { name: &'a str, raw: &'a str },
+    Connection { label: &'a str, remote_ip: IpAddr, bytes_in: u64, bytes_out: u64 },
 }
 
 fn parse_row(line: &str) -> Option<Row<'_>> {
@@ -280,12 +225,13 @@ fn parse_row(line: &str) -> Option<Row<'_>> {
         let bytes_in = bytes_in_str.parse::<u64>().unwrap_or(0);
         let bytes_out = bytes_out_str.parse::<u64>().unwrap_or(0);
         let remote_ip = parse_remote_ip(label)?;
-        Some(Row::Connection { remote_ip, bytes_in, bytes_out })
+        Some(Row::Connection { label, remote_ip, bytes_in, bytes_out })
     } else {
         // Process row: "<name>.<pid>". Strip the ".pid" suffix so multiple
-        // pids of the same binary aggregate.
+        // pids of the same binary aggregate; keep the raw pid-bearing
+        // label too — the delta tracker keys connections with it.
         let name = strip_pid(label);
-        Some(Row::Process { name })
+        Some(Row::Process { name, raw: label })
     }
 }
 
@@ -314,6 +260,16 @@ pub fn canonical_app(name: &str) -> String {
     }
     if let Some(idx) = name.find(" Helper") {
         return name[..idx].to_string();
+    }
+    // Claude Code's native install names its executable after the bare
+    // version ("~/.local/share/claude/versions/2.1.198"), so nettop
+    // reports the process as "2.1.198". Nothing else names binaries as
+    // pure version strings, so claim those.
+    let mut parts = name.split('.');
+    if parts.clone().count() >= 2
+        && parts.all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    {
+        return "Claude Code".to_string();
     }
     name.to_string()
 }
@@ -380,6 +336,10 @@ pub struct AppStat {
     // Rolling history of *total* (in+out) bytes/sec. Newest at back.
     // Feeds the sparkline and the peak-based sort key.
     pub history: VecDeque<u32>,
+    // Longer per-direction histories (bytes/sec, newest at back) feeding
+    // the charts in the app detail view.
+    pub history_in: VecDeque<u32>,
+    pub history_out: VecDeque<u32>,
     pub conn_count: u32,
     // Per-remote-host breakdown, smoothed the same way as the app totals.
     pub hosts: HashMap<IpAddr, HostTraffic>,
@@ -476,6 +436,8 @@ impl NetworkState {
                 ema_bps_in: 0.0,
                 ema_bps_out: 0.0,
                 history: VecDeque::with_capacity(HISTORY_LEN),
+                history_in: VecDeque::with_capacity(TOTAL_HISTORY_LEN),
+                history_out: VecDeque::with_capacity(TOTAL_HISTORY_LEN),
                 conn_count: 0,
                 hosts: HashMap::new(),
                 last_active: now,
@@ -488,6 +450,16 @@ impl NetworkState {
             // show the actual burstiness, not a pre-smoothed line.
             let total_now = (bps_in + bps_out).clamp(0.0, u32::MAX as f64) as u32;
             push_history(&mut stat.history, total_now, HISTORY_LEN);
+            push_history(
+                &mut stat.history_in,
+                bps_in.clamp(0.0, u32::MAX as f64) as u32,
+                TOTAL_HISTORY_LEN,
+            );
+            push_history(
+                &mut stat.history_out,
+                bps_out.clamp(0.0, u32::MAX as f64) as u32,
+                TOTAL_HISTORY_LEN,
+            );
             stat.conn_count = delta.conn_count;
             if delta.bytes_in + delta.bytes_out > 0 {
                 stat.last_active = now;
@@ -532,6 +504,8 @@ impl NetworkState {
                 stat.ema_bps_out *= 1.0 - alpha;
                 stat.conn_count = 0;
                 push_history(&mut stat.history, 0, HISTORY_LEN);
+                push_history(&mut stat.history_in, 0, TOTAL_HISTORY_LEN);
+                push_history(&mut stat.history_out, 0, TOTAL_HISTORY_LEN);
                 for h in stat.hosts.values_mut() {
                     h.ema_bps_in *= 1.0 - alpha;
                     h.ema_bps_out *= 1.0 - alpha;
@@ -665,6 +639,20 @@ mod tests {
     }
 
     #[test]
+    fn canonicalizes_claude_code_version_binary() {
+        // Claude Code's native install runs an executable named after the
+        // bare version, e.g. "~/.local/share/claude/versions/2.1.198".
+        assert_eq!(canonical_app("2.1.198"), "Claude Code");
+        assert_eq!(canonical_app("10.0"), "Claude Code");
+        // Names that merely contain digits/dots but aren't pure version
+        // strings pass through untouched.
+        assert_eq!(canonical_app("iTerm2"), "iTerm2");
+        assert_eq!(canonical_app("2.1.198beta"), "2.1.198beta");
+        assert_eq!(canonical_app("509"), "509");
+        assert_eq!(canonical_app(".198"), ".198");
+    }
+
+    #[test]
     fn parses_tcp4_remote() {
         let ip = parse_remote_ip("tcp4 192.168.1.142:52544<->140.82.112.26:443").unwrap();
         assert_eq!(ip.to_string(), "140.82.112.26");
@@ -703,23 +691,40 @@ mod tests {
         assert!(!is_ignorable(&"10.0.0.1".parse().unwrap()));
     }
 
+    // Mirrors real `nettop -x -n -L 1` output: header row, then process
+    // rows each followed by their connection rows, cumulative counters.
+    const SNAP_1: &str = "\
+,bytes_in,bytes_out,
+firefox.935,999999999,888888888,
+tcp4 192.168.1.142:52541<->151.101.1.91:443,999999000,888888000,
+tcp4 192.168.1.142:52539<->35.186.224.31:443,999,888,
+";
+    const SNAP_2: &str = "\
+,bytes_in,bytes_out,
+firefox.935,1000000699,888888388,
+tcp4 192.168.1.142:52541<->151.101.1.91:443,999999700,888888300,
+tcp4 192.168.1.142:52539<->35.186.224.31:443,1299,1088,
+";
+
     #[test]
-    fn parses_a_full_sample_from_captured_nettop() {
-        // Two consecutive rows from the captured `nettop -x -n -d` output.
-        // Both belong to firefox.935 — they should aggregate into one app
-        // ("Firefox") with two distinct remote hosts. We prime past the
-        // baseline first (two header finishes) so the third sample is a
-        // real emitted one.
-        let mut b = SampleBuilder::new();
-        assert!(b.finish().is_none()); // #1: pre-first-header
-        assert!(b.finish().is_none()); // #2: cumulative baseline drop
-        b.push_row("firefox.935,1000,500,");
-        b.push_row("tcp4 192.168.1.142:52541<->151.101.1.91:443,700,300,");
-        b.push_row("tcp4 192.168.1.142:52539<->35.186.224.31:443,300,200,");
-        let sample = b.finish().unwrap();
-        assert_eq!(sample.total_in, 1000);
-        assert_eq!(sample.total_out, 500);
-        assert_eq!(sample.apps.len(), 1);
+    fn first_snapshot_is_all_baseline() {
+        // Everything in the first snapshot predates the monitor — its
+        // huge cumulative counters must register as zero traffic, but
+        // the connection inventory should still come through.
+        let mut t = DeltaTracker::new();
+        let sample = t.build_sample(SNAP_1);
+        assert_eq!(sample.total_in, 0);
+        assert_eq!(sample.total_out, 0);
+        assert_eq!(sample.apps["Firefox"].conn_count, 2);
+    }
+
+    #[test]
+    fn diffs_cumulative_counters_between_snapshots() {
+        let mut t = DeltaTracker::new();
+        t.build_sample(SNAP_1);
+        let sample = t.build_sample(SNAP_2);
+        assert_eq!(sample.total_in, 1000); // 700 + 300
+        assert_eq!(sample.total_out, 500); // 300 + 200
         let app = &sample.apps["Firefox"];
         assert_eq!(app.bytes_in, 1000);
         assert_eq!(app.bytes_out, 500);
@@ -731,45 +736,65 @@ mod tests {
     }
 
     #[test]
+    fn connection_appearing_after_priming_counts_in_full() {
+        // A connection born between snapshots: its whole counter is this
+        // interval's traffic.
+        let mut t = DeltaTracker::new();
+        t.build_sample(",bytes_in,bytes_out,\n");
+        let sample = t.build_sample(SNAP_1);
+        assert_eq!(sample.total_in, 999999999);
+        assert_eq!(sample.total_out, 888888888);
+    }
+
+    #[test]
+    fn counter_regression_reads_as_fresh_connection() {
+        // Same 4-tuple, smaller counter ⇒ the old connection closed and
+        // a new one took its place; count the new one's bytes.
+        let mut t = DeltaTracker::new();
+        t.build_sample(SNAP_1);
+        let sample = t.build_sample(
+            "\
+,bytes_in,bytes_out,
+firefox.935,150,60,
+tcp4 192.168.1.142:52541<->151.101.1.91:443,150,60,
+",
+        );
+        assert_eq!(sample.total_in, 150);
+        assert_eq!(sample.total_out, 60);
+    }
+
+    #[test]
     fn bundles_helper_processes_into_one_app() {
         // Two Chrome helper processes talking to the same remote host
-        // must fold into a single "Google Chrome" aggregate.
-        let mut b = SampleBuilder::new();
-        assert!(b.finish().is_none());
-        assert!(b.finish().is_none());
-        b.push_row("Google Chrome Helper (GPU).412,100,10,");
-        b.push_row("tcp4 192.168.1.142:52541<->142.250.72.14:443,100,10,");
-        b.push_row("Google Chrome Helper (Renderer).977,200,20,");
-        b.push_row("tcp4 192.168.1.142:52542<->142.250.72.14:443,200,20,");
-        let sample = b.finish().unwrap();
+        // must fold into a single "Google Chrome" aggregate — but their
+        // identical connection descriptors must NOT collide in the delta
+        // tracker (the pid-bearing label keeps the keys distinct).
+        let mut t = DeltaTracker::new();
+        t.build_sample(
+            "\
+,bytes_in,bytes_out,
+Google Chrome Helper (GPU).412,0,0,
+tcp4 192.168.1.142:52541<->142.250.72.14:443,0,0,
+Google Chrome Helper (Renderer).977,0,0,
+tcp4 192.168.1.142:52541<->142.250.72.14:443,0,0,
+",
+        );
+        let sample = t.build_sample(
+            "\
+,bytes_in,bytes_out,
+Google Chrome Helper (GPU).412,100,10,
+tcp4 192.168.1.142:52541<->142.250.72.14:443,100,10,
+Google Chrome Helper (Renderer).977,200,20,
+tcp4 192.168.1.142:52541<->142.250.72.14:443,200,20,
+",
+        );
         assert_eq!(sample.apps.len(), 1);
         let app = &sample.apps["Google Chrome"];
         assert_eq!(app.bytes_in, 300);
         assert_eq!(app.bytes_out, 30);
         assert_eq!(app.conn_count, 2);
-        assert_eq!(app.hosts.len(), 1);
         let host: IpAddr = "142.250.72.14".parse().unwrap();
         assert_eq!(app.hosts[&host].bytes_in, 300);
         assert_eq!(app.hosts[&host].conn_count, 2);
-    }
-
-    #[test]
-    fn drops_the_baseline_sample() {
-        // Simulate the nettop stream: header, baseline data, header,
-        // first real delta data, header. The baseline (huge cumulative
-        // values) must be dropped; only the real delta emerges.
-        let mut b = SampleBuilder::new();
-        // First header seen with no data yet.
-        assert!(b.finish().is_none(), "pre-baseline header returns None");
-        // Baseline row values.
-        b.push_row("firefox.935,999999999,999999999,");
-        b.push_row("tcp4 192.168.1.142:52541<->151.101.1.91:443,999999999,999999999,");
-        assert!(b.finish().is_none(), "baseline sample must not be emitted");
-        // Real delta.
-        b.push_row("firefox.935,100,50,");
-        b.push_row("tcp4 192.168.1.142:52541<->151.101.1.91:443,100,50,");
-        let sample = b.finish().expect("first real sample is emitted");
-        assert_eq!(sample.total_in, 100);
-        assert_eq!(sample.total_out, 50);
     }
 }
