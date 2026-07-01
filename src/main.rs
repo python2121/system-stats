@@ -109,7 +109,10 @@ impl App {
         if got_new {
             self.graph_cache.clear();
             self.clamp_selection();
-            self.left_scroll = 0;
+            // Don't reset left_scroll — the user may be mid-pan in the graph.
+            // Scroll only resets on selection change (see move_selection / Esc).
+            // If the new graph is shorter than the current offset, the next
+            // key press clamps via scroll_left_pane.
         }
     }
 
