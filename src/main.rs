@@ -1,3 +1,4 @@
+mod claude;
 mod config;
 mod git;
 mod hardware;
@@ -18,6 +19,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Tabs},
 };
 
+use claude::{ClaudeTree, ProjectSessions};
 use config::Config;
 use git::{GitTree, GraphRow, RecentCommit, Scanner, spawn_scanner};
 use hardware::{BatterySnapshot, HardwareState};
@@ -38,10 +40,13 @@ enum Tab {
     Processes,
     Network,
     DiskPower,
+    Claude,
 }
 
-const TABS: [Tab; 4] = [Tab::GitStatus, Tab::Processes, Tab::Network, Tab::DiskPower];
-const TAB_LABELS: [&str; 4] = ["Git Status", "Processes", "Network", "Disk / Power"];
+const TABS: [Tab; 5] =
+    [Tab::GitStatus, Tab::Processes, Tab::Network, Tab::DiskPower, Tab::Claude];
+const TAB_LABELS: [&str; 5] =
+    ["Git Status", "Processes", "Network", "Disk / Power", "Claude"];
 
 impl Tab {
     fn index(self) -> usize {
@@ -270,6 +275,17 @@ struct App {
     // Disk/power tab — a pure dashboard, so state only, no selection.
     hw_monitor: hardware::Monitor,
     hw_state: HardwareState,
+    // Claude tab — its own scanner (same wake/root pattern as the git
+    // scanner) plus the familiar name-keyed selection / detail / scroll trio.
+    claude_scanner: claude::Scanner,
+    claude_tree: Option<ClaudeTree>,
+    claude_selected: Option<String>,
+    claude_detail: Option<String>,
+    claude_scroll: Cell<u16>,
+    // Detail-view scroll: the offset lives on App (key handler clamps it),
+    // the max is cached during draw where the rendered height is known.
+    claude_detail_scroll: u16,
+    claude_detail_max: Cell<u16>,
     // Modal menu stack. Empty when no menu is showing. Esc pops one level;
     // picking an item can push another level (e.g. Main → Settings).
     // Always renders the top-of-stack; lower levels are hidden behind it.
@@ -294,6 +310,7 @@ impl App {
             None
         };
         let scanner = spawn_scanner(config.watch_dir.clone());
+        let claude_scanner = claude::spawn_scanner(config.watch_dir.clone());
         Self {
             scanner,
             config,
@@ -318,6 +335,13 @@ impl App {
             proc_scroll: Cell::new(0),
             hw_monitor: hardware::spawn_monitor(),
             hw_state: HardwareState::new(),
+            claude_scanner,
+            claude_tree: None,
+            claude_selected: None,
+            claude_detail: None,
+            claude_scroll: Cell::new(0),
+            claude_detail_scroll: 0,
+            claude_detail_max: Cell::new(0),
             menu_stack: Vec::new(),
             dir_prompt,
             should_quit: false,
@@ -370,6 +394,29 @@ impl App {
     fn drain_hardware_updates(&mut self) {
         while let Ok(sample) = self.hw_monitor.try_recv() {
             self.hw_state.apply_sample(sample);
+        }
+    }
+
+    fn drain_claude_updates(&mut self) {
+        while let Ok(tree) = self.claude_scanner.try_recv() {
+            // Same stale-root guard as the git scanner.
+            if tree.root != self.config.watch_dir {
+                continue;
+            }
+            self.claude_tree = Some(tree);
+        }
+        // A project whose sessions all vanished can't stay selected or detailed.
+        if let Some(tree) = &self.claude_tree {
+            if let Some(n) = &self.claude_detail {
+                if !tree.projects.iter().any(|p| p.name == *n) {
+                    self.claude_detail = None;
+                }
+            }
+            if let Some(n) = &self.claude_selected {
+                if !tree.projects.iter().any(|p| p.name == *n) {
+                    self.claude_selected = None;
+                }
+            }
         }
     }
 
@@ -671,6 +718,116 @@ impl App {
         }
     }
 
+    fn claude_sorted_names(&self) -> Vec<String> {
+        self.claude_tree
+            .as_ref()
+            .map(|t| t.projects.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    // Move the Claude-tab project cursor by `delta` positions. Same
+    // semantics as move_net_selection / move_proc_selection.
+    fn move_claude_selection(&mut self, delta: i32) {
+        let order = self.claude_sorted_names();
+        if order.is_empty() {
+            return;
+        }
+        let next = match self
+            .claude_selected
+            .as_ref()
+            .and_then(|n| order.iter().position(|o| o == n))
+        {
+            None => 0,
+            Some(i) => (i as i32 + delta).clamp(0, order.len() as i32 - 1) as usize,
+        };
+        self.claude_selected = Some(order[next].clone());
+    }
+
+    // The Claude tab's own interactions — the same shape as
+    // handle_network_key / handle_process_key, except the detail view
+    // scrolls (a project can hold more sessions than fit on screen).
+    fn handle_claude_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return false; // Ctrl-C etc. always reach the shared handler.
+        }
+        if self.claude_detail.is_some() {
+            return match key.code {
+                KeyCode::Esc => {
+                    self.claude_detail = None;
+                    true
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.claude_detail_scroll =
+                        self.claude_detail_scroll.saturating_sub(1);
+                    true
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.claude_detail_scroll = (self.claude_detail_scroll + 1)
+                        .min(self.claude_detail_max.get());
+                    true
+                }
+                KeyCode::Char('q') => false,
+                _ => true,
+            };
+        }
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.focus == Focus::Tabs {
+                    // Drop from the tab bar into the list, cursor on top.
+                    self.focus = Focus::Right;
+                    if self.claude_selected.is_none() {
+                        self.move_claude_selection(0);
+                    }
+                } else {
+                    self.move_claude_selection(1);
+                }
+                true
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.focus == Focus::Tabs {
+                    return true;
+                }
+                let order = self.claude_sorted_names();
+                let at_top = match &self.claude_selected {
+                    Some(n) => order.first() == Some(n),
+                    None => true,
+                };
+                if at_top {
+                    // Past the top of the list → back up to the tab bar.
+                    self.focus = Focus::Tabs;
+                    self.claude_selected = None;
+                } else {
+                    self.move_claude_selection(-1);
+                }
+                true
+            }
+            KeyCode::Enter => {
+                if self.focus != Focus::Tabs {
+                    if let Some(n) = &self.claude_selected {
+                        self.claude_detail = Some(n.clone());
+                        self.claude_detail_scroll = 0;
+                    }
+                }
+                true
+            }
+            KeyCode::Esc => {
+                if self.focus == Focus::Tabs {
+                    false // shared handler opens the menu
+                } else {
+                    self.claude_selected = None;
+                    self.focus = Focus::Tabs;
+                    true
+                }
+            }
+            // In-list Left/Right is meaningless (single pane) — swallow
+            // so the git-tab pane-switching semantics don't kick in.
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+                self.focus != Focus::Tabs
+            }
+            _ => false,
+        }
+    }
+
     fn menu_move(&mut self, delta: i32) {
         let Some(top) = self.menu_stack.last_mut() else { return };
         let n = top.labels().len() as i32;
@@ -731,9 +888,15 @@ impl App {
             }
             self.config = new_config;
         }
-        // Only touch the scanner + repo state when the path actually moved.
-        // A no-op accept shouldn't churn a rescan.
+        // Only touch the scanners + per-tab state when the path actually
+        // moved. A no-op accept shouldn't churn a rescan.
         if !same_path {
+            self.claude_scanner.set_root(resolved.clone());
+            self.claude_tree = None;
+            self.claude_selected = None;
+            self.claude_detail = None;
+            self.claude_scroll.set(0);
+            self.claude_detail_scroll = 0;
             self.scanner.set_root(resolved);
             self.git_tree = None;
             self.graph_cache.clear();
@@ -843,6 +1006,9 @@ impl App {
         if self.selected_tab == Tab::Processes && self.handle_process_key(key) {
             return;
         }
+        if self.selected_tab == Tab::Claude && self.handle_claude_key(key) {
+            return;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), _) => self.should_quit = true,
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
@@ -915,6 +1081,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
         app.drain_network_updates();
         app.drain_process_updates();
         app.drain_hardware_updates();
+        app.drain_claude_updates();
         app.ensure_graph_loaded();
         terminal.draw(|f| draw(f, app))?;
         app.handle_events()?;
@@ -935,6 +1102,7 @@ fn draw(f: &mut Frame, app: &App) {
         Tab::Processes => draw_processes(f, app, vertical[1]),
         Tab::Network => draw_network(f, app, vertical[1]),
         Tab::DiskPower => draw_disk_power(f, app, vertical[1]),
+        Tab::Claude => draw_claude(f, app, vertical[1]),
     }
 
     if !app.menu_stack.is_empty() {
@@ -3644,5 +3812,424 @@ fn format_minutes(min: i64) -> String {
     } else {
         format!("{min}m")
     }
+}
+
+// -------------------- claude tab --------------------
+
+// Sessions shown inline on each project card; the rest are behind Enter.
+const CLAUDE_SESSIONS_SHOWN: usize = 3;
+// Tool names shown in a session's activity-profile summary.
+const CLAUDE_TOOLS_SHOWN: usize = 3;
+
+// Token count → "850 tok" / "12.4k tok" / "1.2M tok".
+fn format_tokens(n: u64) -> String {
+    if n < 1_000 {
+        format!("{n} tok")
+    } else if n < 1_000_000 {
+        format!("{:.1}k tok", n as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M tok", n as f64 / 1_000_000.0)
+    }
+}
+
+// Seconds → "40s" / "45m" / "12h 47m" — wall-clock span, so hours matter
+// but sub-minute precision doesn't once past the first minute.
+fn format_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3_600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h {:02}m", secs / 3_600, (secs % 3_600) / 60)
+    }
+}
+
+// Activity bullet for one session: live sessions glow green, recent ones
+// (< 1 day) read as present, older ones fade — same visual language as
+// the git-repo and network-app bullets.
+fn claude_session_bullet(session: &claude::SessionInfo, now: u64) -> (&'static str, Color) {
+    if session.live.is_some() {
+        ("●", Color::Green)
+    } else if now.saturating_sub(session.last_activity) < 86_400 {
+        ("○", Color::Gray)
+    } else {
+        ("·", Color::DarkGray)
+    }
+}
+
+// Session title with a fallback for transcripts where no typed prompt was
+// found (or parsing came up empty): the session id's first block.
+fn claude_session_title(session: &claude::SessionInfo) -> String {
+    if !session.title.is_empty() {
+        return session.title.clone();
+    }
+    let short = session.id.get(..8).unwrap_or(&session.id);
+    format!("session {short}")
+}
+
+fn draw_claude(f: &mut Frame, app: &App, area: Rect) {
+    let Some(tree) = &app.claude_tree else {
+        let msg = format!("scanning {} …", config::display_path(&app.config.watch_dir));
+        let para = Paragraph::new(msg).style(Style::reset()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .style(Style::reset())
+                .title(" Claude "),
+        );
+        f.render_widget(para, area);
+        return;
+    };
+
+    // Detail view replaces the whole tab body while open.
+    if let Some(name) = &app.claude_detail {
+        if let Some(project) = tree.projects.iter().find(|p| p.name == *name) {
+            draw_claude_detail(f, app, project, area);
+            return;
+        }
+    }
+    draw_claude_list(f, app, tree, area);
+}
+
+fn draw_claude_list(f: &mut Frame, app: &App, tree: &ClaudeTree, area: Rect) {
+    let focused = app.focus == Focus::Right;
+    // Round to 5-second increments so the title doesn't flicker every tick.
+    let rounded = (tree.scanned_at.elapsed().as_secs() / 5) * 5;
+    let live_part = if tree.live_count > 0 {
+        format!(" · {} live", tree.live_count)
+    } else {
+        String::new()
+    };
+    let hint = if focused {
+        " (↑/↓ select · Enter sessions)"
+    } else {
+        ""
+    };
+    let title = format!(
+        " Claude — {} project{} · {} session{}{live_part} · scanned {rounded}s ago{hint} ",
+        tree.projects.len(),
+        if tree.projects.len() == 1 { "" } else { "s" },
+        tree.total_sessions,
+        if tree.total_sessions == 1 { "" } else { "s" },
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .style(Style::reset())
+        .title(title);
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut lines: Vec<Line<'static>> = vec![Line::from("")];
+    // (start_line, height) of the selected card, for scroll-into-view.
+    let mut selected_extent: Option<(u16, u16)> = None;
+    if tree.projects.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  no Claude Code sessions under {}.", tree.root_display),
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for project in &tree.projects {
+            let selected =
+                focused && app.claude_selected.as_deref() == Some(project.name.as_str());
+            let start = lines.len() as u16;
+            append_claude_card(&mut lines, project, now, inner_width, selected);
+            lines.push(Line::from(""));
+            if selected {
+                selected_extent = Some((start, lines.len() as u16 - start));
+            }
+        }
+    }
+
+    let scroll =
+        scroll_into_view(&app.claude_scroll, selected_extent, lines.len() as u16, inner_height);
+
+    let para = Paragraph::new(lines)
+        .style(Style::reset())
+        .scroll((scroll, 0))
+        .block(block);
+    f.render_widget(para, area);
+}
+
+// One project "card": headline row (accent-colored name · session count ·
+// age · live badge) plus its most recent sessions nested underneath —
+// the Claude-tab analog of append_app_card.
+fn append_claude_card(
+    lines: &mut Vec<Line<'static>>,
+    project: &ProjectSessions,
+    now: u64,
+    inner_width: usize,
+    selected: bool,
+) {
+    let accent = app_accent(&project.name);
+    let live_n = project.sessions.iter().filter(|s| s.live.is_some()).count();
+    let age_secs = project.last_activity.map(|t| now.saturating_sub(t));
+    let age_str = age_secs.map(format_age).unwrap_or_else(|| "—".to_string());
+    let (bullet, bullet_color) = if live_n > 0 {
+        ("●", Color::Green)
+    } else if age_secs.map(|s| s < 86_400).unwrap_or(false) {
+        ("○", Color::Gray)
+    } else {
+        ("·", Color::DarkGray)
+    };
+
+    let marker: Span<'static> = if selected {
+        Span::styled("▶ ", Style::default().fg(Color::Cyan))
+    } else {
+        Span::raw("  ")
+    };
+    let mut header_spans = vec![
+        marker,
+        Span::styled(bullet.to_string(), Style::default().fg(bullet_color)),
+        Span::raw(" "),
+        Span::styled(
+            project.name.clone(),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "   {} session{} · {age_str}",
+                project.sessions.len(),
+                if project.sessions.len() == 1 { "" } else { "s" },
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if live_n > 0 {
+        header_spans.push(Span::styled(
+            format!("   ● {live_n} live"),
+            Style::default().fg(Color::Green),
+        ));
+    }
+    lines.push(Line::from(header_spans));
+
+    // Most recent sessions, nested as a dim tree: title on the left,
+    // prompt count / branch / age (and live status) on the right edge.
+    let top: Vec<&claude::SessionInfo> =
+        project.sessions.iter().take(CLAUDE_SESSIONS_SHOWN).collect();
+    let extra = project.sessions.len().saturating_sub(top.len());
+    let tree_style = Style::default().fg(Color::DarkGray);
+    for (i, session) in top.iter().enumerate() {
+        let is_last = i == top.len() - 1 && extra == 0;
+        let connector = if is_last { "└─ " } else { "├─ " };
+        let (s_bullet, s_color) = claude_session_bullet(session, now);
+
+        let mut meta = format!(
+            "{} prompt{}",
+            session.prompt_count,
+            if session.prompt_count == 1 { "" } else { "s" },
+        );
+        if let Some(branch) = &session.git_branch {
+            meta.push_str(&format!(" · {branch}"));
+        }
+        meta.push_str(&format!(
+            " · {}",
+            format_age_short(now.saturating_sub(session.last_activity)),
+        ));
+        let live_meta = session
+            .live
+            .as_ref()
+            .map(|l| format!(" · ● {}", l.status))
+            .unwrap_or_default();
+
+        // 4 indent + 3 connector + 2 bullet + title + 2 + meta + 2 margin.
+        let title_w = inner_width
+            .saturating_sub(4 + 3 + 2 + 2 + meta.chars().count() + live_meta.chars().count() + 2)
+            .max(10);
+        let title_display = truncate(&claude_session_title(session), title_w);
+        let title_pad = title_w.saturating_sub(title_display.chars().count());
+        let title_style = if session.live.is_some() {
+            Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::raw("    "),
+            Span::styled(connector.to_string(), tree_style),
+            Span::styled(s_bullet.to_string(), Style::default().fg(s_color)),
+            Span::raw(" "),
+            Span::styled(title_display, title_style),
+            Span::raw(" ".repeat(title_pad + 2)),
+            Span::styled(meta, tree_style),
+        ];
+        if !live_meta.is_empty() {
+            spans.push(Span::styled(live_meta, Style::default().fg(Color::Green)));
+        }
+        lines.push(Line::from(spans));
+
+        // Live sessions get their most recent prompt underneath — "what
+        // is it working on right now". The continuation column keeps the
+        // tree's spine intact when siblings follow.
+        if session.live.is_some() && !session.last_prompt.is_empty() {
+            let continuation = if is_last { "   " } else { "│  " };
+            let avail = inner_width.saturating_sub(4 + 3 + 2 + 2);
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(continuation.to_string(), tree_style),
+                Span::styled(
+                    format!("↳ {}", truncate(&session.last_prompt, avail)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+    }
+    if extra > 0 {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                format!(
+                    "└─ … {extra} more session{}",
+                    if extra == 1 { "" } else { "s" },
+                ),
+                tree_style,
+            ),
+        ]));
+    }
+}
+
+// Full-tab detail view for one project: every session, newest first, two
+// lines each (title, then id / prompts / branch / age / live status).
+fn draw_claude_detail(f: &mut Frame, app: &App, project: &ProjectSessions, area: Rect) {
+    let accent = app_accent(&project.name);
+    let n = project.sessions.len();
+    let title = format!(
+        " {} — {} · {} session{} · ↑/↓ scroll · Esc to close ",
+        project.name,
+        config::display_path(&project.path),
+        n,
+        if n == 1 { "" } else { "s" },
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .style(Style::reset())
+        .title(title);
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut lines: Vec<Line<'static>> = vec![Line::from("")];
+    for session in &project.sessions {
+        let (s_bullet, s_color) = claude_session_bullet(session, now);
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(s_bullet.to_string(), Style::default().fg(s_color)),
+            Span::raw(" "),
+            Span::styled(
+                truncate(&claude_session_title(session), inner_width.saturating_sub(6)),
+                Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        let short = session.id.get(..8).unwrap_or(&session.id);
+        let mut meta = format!(
+            "{short} · {} prompt{}",
+            session.prompt_count,
+            if session.prompt_count == 1 { "" } else { "s" },
+        );
+        if let Some(branch) = &session.git_branch {
+            meta.push_str(&format!(" · {branch}"));
+        }
+        meta.push_str(&format!(
+            " · {}",
+            format_age(now.saturating_sub(session.last_activity)),
+        ));
+        let mut meta_spans = vec![
+            Span::raw("    "),
+            Span::styled(meta, Style::default().fg(Color::DarkGray)),
+        ];
+        if let Some(live) = &session.live {
+            let name_part = if live.name.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", live.name)
+            };
+            meta_spans.push(Span::styled(
+                format!(" · ● {}{name_part}", live.status),
+                Style::default().fg(Color::Green),
+            ));
+            meta_spans.push(Span::styled(
+                format!("  pid {}", live.pid),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(meta_spans));
+
+        // Effort + activity profile: wall-clock span, output tokens, and
+        // the most-used tools ("15 Edit · 10 Read" reads as a build
+        // session, "15 WebSearch" as research).
+        let mut stats: Vec<String> = Vec::new();
+        if session.duration_secs > 0 {
+            stats.push(format_duration(session.duration_secs));
+        }
+        if session.output_tokens > 0 {
+            stats.push(format!("{} out", format_tokens(session.output_tokens)));
+        }
+        if !session.tool_counts.is_empty() {
+            let shown: Vec<String> = session
+                .tool_counts
+                .iter()
+                .take(CLAUDE_TOOLS_SHOWN)
+                .map(|(name, count)| format!("{count} {name}"))
+                .collect();
+            let extra = session.tool_counts.len().saturating_sub(shown.len());
+            let more = if extra > 0 { format!(" +{extra}") } else { String::new() };
+            stats.push(format!("{}{more}", shown.join(" · ")));
+        }
+        if !stats.is_empty() {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(stats.join("  ·  "), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+
+        // The session's most recent prompt — where it left off. Skipped
+        // when it's all there is (single-prompt sessions whose title IS
+        // the last prompt).
+        if !session.last_prompt.is_empty() && session.last_prompt != session.title {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(
+                    format!(
+                        "↳ {}",
+                        truncate(&session.last_prompt, inner_width.saturating_sub(8)),
+                    ),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+    if project.sessions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no sessions.",
+            Style::default().fg(accent),
+        )));
+    }
+
+    // Cache the max offset so the key handler can clamp; render clamps
+    // again in case the pane shrank since the last keypress.
+    let max_scroll = (lines.len() as u16).saturating_sub(inner_height);
+    app.claude_detail_max.set(max_scroll);
+    let scroll = app.claude_detail_scroll.min(max_scroll);
+
+    let para = Paragraph::new(lines)
+        .style(Style::reset())
+        .scroll((scroll, 0))
+        .block(block);
+    f.render_widget(para, area);
 }
 
