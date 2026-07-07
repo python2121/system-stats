@@ -44,9 +44,9 @@ enum Tab {
 }
 
 const TABS: [Tab; 5] =
-    [Tab::GitStatus, Tab::Processes, Tab::Network, Tab::DiskPower, Tab::Claude];
+    [Tab::GitStatus, Tab::Claude, Tab::Processes, Tab::Network, Tab::DiskPower];
 const TAB_LABELS: [&str; 5] =
-    ["Git Status", "Processes", "Network", "Disk / Power", "Claude"];
+    ["Git Status", "Claude", "Processes", "Network", "Disk / Power"];
 
 impl Tab {
     fn index(self) -> usize {
@@ -551,7 +551,9 @@ impl App {
         // quit is inert while it's open.
         if self.net_detail.is_some() {
             return match key.code {
-                KeyCode::Esc => {
+                // Left mirrors Esc: "go back up a level" for arrow-key
+                // navigation, matching Enter/Right-style drill-down flows.
+                KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
                     self.net_detail = None;
                     true
                 }
@@ -653,7 +655,9 @@ impl App {
         // quit is inert while it's open.
         if self.proc_detail.is_some() {
             return match key.code {
-                KeyCode::Esc => {
+                // Left mirrors Esc: "go back up a level" for arrow-key
+                // navigation, matching Enter/Right-style drill-down flows.
+                KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
                     self.proc_detail = None;
                     true
                 }
@@ -752,7 +756,9 @@ impl App {
         }
         if self.claude_detail.is_some() {
             return match key.code {
-                KeyCode::Esc => {
+                // Left mirrors Esc: "go back up a level" for arrow-key
+                // navigation, matching Enter/Right-style drill-down flows.
+                KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
                     self.claude_detail = None;
                     true
                 }
@@ -4012,8 +4018,15 @@ fn append_claude_card(
 
     // Most recent sessions, nested as a dim tree: title on the left,
     // prompt count / branch / age (and live status) on the right edge.
-    let top: Vec<&claude::SessionInfo> =
-        project.sessions.iter().take(CLAUDE_SESSIONS_SHOWN).collect();
+    // Live sessions are always shown even past the recency cutoff, so a
+    // project running many agents at once lists every one of them.
+    let top: Vec<&claude::SessionInfo> = project
+        .sessions
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| *i < CLAUDE_SESSIONS_SHOWN || s.live.is_some())
+        .map(|(_, s)| s)
+        .collect();
     let extra = project.sessions.len().saturating_sub(top.len());
     let tree_style = Style::default().fg(Color::DarkGray);
     for (i, session) in top.iter().enumerate() {
