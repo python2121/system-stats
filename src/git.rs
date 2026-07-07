@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crate::config;
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(30);
+const FETCH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const MAX_REPOS: usize = 30;
 const MAX_BRANCHES_PER_REPO: usize = 8;
 const HEATMAP_LOOKBACK_DAYS: u32 = 400;
@@ -113,6 +114,29 @@ pub fn spawn_scanner(initial_root: PathBuf) -> Scanner {
     let (wake_tx, wake_rx) = mpsc::channel();
     let root = Arc::new(Mutex::new(initial_root));
     let thread_root = Arc::clone(&root);
+
+    // Fetch thread: refreshes remote-tracking refs (origin/main etc.) so
+    // ahead/behind counts reflect the server, not just the last manual pull.
+    // Separate from the scan thread so a slow network fetch never delays the
+    // 30-second scan cadence.
+    let fetch_root = Arc::clone(&root);
+    let fetch_wake = wake_tx.clone();
+    thread::spawn(move || {
+        loop {
+            let current = fetch_root.lock().ok().map(|g| g.clone());
+            if let Some(root) = current {
+                fetch_repos(&root);
+            }
+            // Poke the scanner so fresh ahead/behind counts show up now
+            // instead of at the next scan tick. A send error means the
+            // scanner (and UI) are gone, so stop fetching too.
+            if fetch_wake.send(()).is_err() {
+                return;
+            }
+            thread::sleep(FETCH_INTERVAL);
+        }
+    });
+
     thread::spawn(move || {
         loop {
             let current = thread_root.lock().ok().map(|g| g.clone());
@@ -153,12 +177,7 @@ fn scan(root: &Path) -> Option<GitTree> {
         });
     }
 
-    let repo_paths: Vec<PathBuf> = std::fs::read_dir(&root)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.join(".git").exists())
-        .collect();
+    let repo_paths = repo_paths(root)?;
 
     let author = user_email();
     let mut recent_commits: Vec<RecentCommit> = Vec::new();
@@ -197,6 +216,38 @@ fn scan(root: &Path) -> Option<GitTree> {
         commit_days: agg_days,
         scanned_at: Instant::now(),
     })
+}
+
+fn repo_paths(root: &Path) -> Option<Vec<PathBuf>> {
+    Some(
+        std::fs::read_dir(root)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.join(".git").exists())
+            .collect(),
+    )
+}
+
+// Refresh remote-tracking refs for every watched repo. Fetch is purely
+// additive: it downloads new commits and moves refs like origin/main, but
+// never touches local branches or the working tree. The env vars force git
+// to fail instead of prompting for credentials — a background thread has no
+// terminal to answer on, so a prompt would hang the fetch loop forever.
+// Repos that need interactive auth just stay stale until fetched manually.
+fn fetch_repos(root: &Path) {
+    let Some(paths) = repo_paths(root) else {
+        return;
+    };
+    for path in paths {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes -oConnectTimeout=5")
+            .args(["fetch", "--all", "--quiet"])
+            .output();
+    }
 }
 
 fn user_email() -> Option<String> {
