@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -27,6 +28,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config;
 
+// Steady-state cadence; halved while the Claude tab is focused (steady-
+// state scans are just directory stats thanks to the mtime cache, so the
+// faster cadence is cheap).
 const SCAN_INTERVAL: Duration = Duration::from_secs(10);
 // Titles are truncated again by the UI to fit the pane; this just bounds
 // what we keep in memory per session.
@@ -80,6 +84,10 @@ pub struct SessionInfo {
     // Tool invocations by name, most-used first — the session's activity
     // profile (lots of Edit = building, lots of WebSearch = research).
     pub tool_counts: Vec<(String, u32)>,
+    // Models that produced the session's assistant messages, by message
+    // count, most-used first. Usually one entry; more when the session
+    // mixed models (subagents, /model switches, fallbacks).
+    pub models: Vec<(String, u32)>,
     // Present when a running Claude Code process owns this session.
     pub live: Option<LiveSession>,
 }
@@ -100,6 +108,7 @@ pub struct Scanner {
     tree_rx: Receiver<ClaudeTree>,
     wake_tx: Sender<()>,
     root: Arc<Mutex<PathBuf>>,
+    focused: Arc<AtomicBool>,
 }
 
 impl Scanner {
@@ -113,6 +122,16 @@ impl Scanner {
         }
         let _ = self.wake_tx.send(());
     }
+
+    // Claude tab focus: scan twice as often while the user is looking at
+    // it, and kick off a scan right away on gaining focus so the tab
+    // opens on fresh data instead of up-to-10s-old data.
+    pub fn set_focused(&self, focused: bool) {
+        let was = self.focused.swap(focused, Ordering::Relaxed);
+        if focused && !was {
+            let _ = self.wake_tx.send(());
+        }
+    }
 }
 
 pub fn spawn_scanner(initial_root: PathBuf) -> Scanner {
@@ -120,6 +139,8 @@ pub fn spawn_scanner(initial_root: PathBuf) -> Scanner {
     let (wake_tx, wake_rx) = mpsc::channel();
     let root = Arc::new(Mutex::new(initial_root));
     let thread_root = Arc::clone(&root);
+    let focused = Arc::new(AtomicBool::new(false));
+    let thread_focused = Arc::clone(&focused);
     thread::spawn(move || {
         // Parsed-transcript cache keyed by file path; entries are reused
         // while (mtime, size) match so only actively-written transcripts
@@ -134,7 +155,12 @@ pub fn spawn_scanner(initial_root: PathBuf) -> Scanner {
                     return;
                 }
             }
-            match wake_rx.recv_timeout(SCAN_INTERVAL) {
+            let interval = if thread_focused.load(Ordering::Relaxed) {
+                SCAN_INTERVAL / 2
+            } else {
+                SCAN_INTERVAL
+            };
+            match wake_rx.recv_timeout(interval) {
                 Ok(()) => {
                     // Collapse a burst of set_root calls into one rescan.
                     while wake_rx.try_recv().is_ok() {}
@@ -144,7 +170,7 @@ pub fn spawn_scanner(initial_root: PathBuf) -> Scanner {
             }
         }
     });
-    Scanner { tree_rx, wake_tx, root }
+    Scanner { tree_rx, wake_tx, root, focused }
 }
 
 struct CacheEntry {
@@ -209,6 +235,7 @@ struct ParsedTranscript {
     output_tokens: u64,
     cost_usd: f64,
     tool_counts: Vec<(String, u32)>,
+    models: Vec<(String, u32)>,
 }
 
 fn scan(root: &Path, cache: &mut HashMap<PathBuf, CacheEntry>) -> ClaudeTree {
@@ -275,6 +302,7 @@ fn scan(root: &Path, cache: &mut HashMap<PathBuf, CacheEntry>) -> ClaudeTree {
                     output_tokens: parsed.output_tokens,
                     cost_usd: parsed.cost_usd,
                     tool_counts: parsed.tool_counts,
+                    models: parsed.models,
                 });
             }
             if sessions.is_empty() {
@@ -325,6 +353,96 @@ fn scan(root: &Path, cache: &mut HashMap<PathBuf, CacheEntry>) -> ClaudeTree {
 
 fn claude_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude"))
+}
+
+// Open a new window in the user's terminal app, cd into the project, and
+// re-attach to a session with `claude --resume`. Fire-and-forget: the
+// launcher process is spawned detached and failures are silent — the new
+// window (or its absence) is its own feedback.
+pub fn resume_in_terminal(
+    terminal: config::TerminalApp,
+    project_dir: &Path,
+    session_id: &str,
+) {
+    let dir = project_dir.display().to_string();
+    let shell_cmd = format!(
+        "cd {} && claude --resume {}",
+        shell_quote(&dir),
+        shell_quote(session_id),
+    );
+
+    let mut cmd = match terminal {
+        // Ghostty ≥ 1.3 ships an AppleScript dictionary. Scripting the
+        // running app avoids `open -na`, which spawns a whole second app
+        // instance; and typing the command via `initial input` (rather
+        // than `command`, which replaces the shell) leaves a normal
+        // interactive shell behind when the claude session ends.
+        config::TerminalApp::Ghostty => {
+            let script = format!(
+                "tell application \"Ghostty\"\n\
+                 activate\n\
+                 set cfg to new surface configuration\n\
+                 set initial working directory of cfg to \"{}\"\n\
+                 set initial input of cfg to \"{}\" & linefeed\n\
+                 new window with configuration cfg\n\
+                 end tell",
+                applescript_escape(&dir),
+                applescript_escape(&format!(
+                    "claude --resume {}",
+                    shell_quote(session_id),
+                )),
+            );
+            let mut c = Command::new("osascript");
+            c.args(["-e", &script]);
+            c
+        }
+        // iTerm: create a window, then type the command into its shell —
+        // the window survives after the claude session ends.
+        config::TerminalApp::Iterm2 => {
+            let script = format!(
+                "tell application \"iTerm\"\n\
+                 activate\n\
+                 set newWindow to (create window with default profile)\n\
+                 tell current session of newWindow to write text \"{}\"\n\
+                 end tell",
+                applescript_escape(&shell_cmd),
+            );
+            let mut c = Command::new("osascript");
+            c.args(["-e", &script]);
+            c
+        }
+        // Terminal.app: `do script` with no target opens a new window.
+        config::TerminalApp::TerminalApp => {
+            let script = format!(
+                "tell application \"Terminal\"\n\
+                 activate\n\
+                 do script \"{}\"\n\
+                 end tell",
+                applescript_escape(&shell_cmd),
+            );
+            let mut c = Command::new("osascript");
+            c.args(["-e", &script]);
+            c
+        }
+    };
+
+    if let Ok(mut child) = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        // Reap the launcher on a background thread so it doesn't linger
+        // as a zombie for the app's lifetime.
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
+// Single-quote for POSIX shells: '…' with embedded quotes as '\''.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+// Escape for embedding inside an AppleScript double-quoted string.
+fn applescript_escape(s: &str) -> String {
+    s.replace('\\', r"\\").replace('"', "\\\"")
 }
 
 // "/Users/andrew/Documents/code/my.app" → "-Users-andrew-Documents-code-my-app".
@@ -500,10 +618,17 @@ fn parse_transcript_text(text: &str) -> ParsedTranscript {
 
     out.output_tokens = stray_tokens;
     out.cost_usd = stray_cost;
+    let mut model_counts: HashMap<String, u32> = HashMap::new();
     for (model, usage) in usage_by_msg.values() {
         out.output_tokens += usage.output;
         out.cost_usd += usage_cost(model, usage);
+        if !model.is_empty() {
+            *model_counts.entry(model.clone()).or_insert(0) += 1;
+        }
     }
+    let mut models: Vec<(String, u32)> = model_counts.into_iter().collect();
+    models.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out.models = models;
     out.duration_secs = match (first_ts, last_ts) {
         (Some(a), Some(b)) => b.saturating_sub(a),
         _ => 0,
@@ -652,6 +777,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shell_and_applescript_quoting() {
+        assert_eq!(shell_quote("/Users/a/My Code"), "'/Users/a/My Code'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(
+            applescript_escape(r#"cd '/a/b' && claude --resume 'x"y'"#),
+            r#"cd '/a/b' && claude --resume 'x\"y'"#,
+        );
+        assert_eq!(applescript_escape(r"back\slash"), r"back\\slash");
+    }
+
+    #[test]
     fn munges_paths_like_claude_code() {
         assert_eq!(
             munge_path(Path::new("/Users/andrew/Documents/code/system-stats")),
@@ -767,6 +903,20 @@ mod tests {
         assert_eq!(model_rates("claude-haiku-4-5-20251001"), (1.0, 5.0));
         // Unknown models price at Opus tier rather than zero.
         assert_eq!(model_rates("claude-next-99"), (5.0, 25.0));
+    }
+
+    #[test]
+    fn models_counted_per_deduped_message() {
+        let p = parse_transcript_text(RICH_TRANSCRIPT);
+        // msg_01AAA's two copies collapse to one Opus message; msg_01BBB
+        // is one Fable message. Equal counts tie-break alphabetically.
+        assert_eq!(
+            p.models,
+            vec![
+                ("claude-fable-5".to_string(), 1),
+                ("claude-opus-4-8".to_string(), 1),
+            ],
+        );
     }
 
     #[test]

@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 const APP_DIR: &str = "system-stats";
 const CONFIG_FILENAME: &str = "config";
 
-// The terminal emulator used to open/attach things from inside the app.
-// Serialized by key so the config file stays human-editable.
+// The terminal emulator the app is running inside. Detected fresh at every
+// launch (never persisted) so it follows the user across terminal apps —
+// someone who uses Ghostty at home and iTerm at work always gets the one
+// they're in right now.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TerminalApp {
     Ghostty,
@@ -15,14 +17,6 @@ pub enum TerminalApp {
 }
 
 impl TerminalApp {
-    pub fn key(self) -> &'static str {
-        match self {
-            TerminalApp::Ghostty => "ghostty",
-            TerminalApp::Iterm2 => "iterm2",
-            TerminalApp::TerminalApp => "terminal",
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             TerminalApp::Ghostty => "Ghostty",
@@ -30,14 +24,22 @@ impl TerminalApp {
             TerminalApp::TerminalApp => "Terminal.app",
         }
     }
+}
 
-    pub fn from_key(s: &str) -> Option<Self> {
-        match s {
-            "ghostty" => Some(TerminalApp::Ghostty),
-            "iterm2" => Some(TerminalApp::Iterm2),
-            "terminal" => Some(TerminalApp::TerminalApp),
-            _ => None,
-        }
+// Best-effort detection of the terminal the app is running inside, via
+// the TERM_PROGRAM variable macOS terminals set for their children.
+// None when unrecognized — e.g. under tmux (which masks the outer
+// terminal as "tmux") or an editor-embedded terminal ("vscode").
+pub fn detect_terminal() -> Option<TerminalApp> {
+    let tp = std::env::var("TERM_PROGRAM").ok()?;
+    if tp.eq_ignore_ascii_case("ghostty") {
+        Some(TerminalApp::Ghostty)
+    } else if tp == "iTerm.app" {
+        Some(TerminalApp::Iterm2)
+    } else if tp == "Apple_Terminal" {
+        Some(TerminalApp::TerminalApp)
+    } else {
+        None
     }
 }
 
@@ -47,7 +49,6 @@ impl TerminalApp {
 #[derive(Clone)]
 pub struct Config {
     pub watch_dir: PathBuf,
-    pub terminal: TerminalApp,
 }
 
 impl Config {
@@ -75,19 +76,15 @@ impl Config {
 
     fn serialize(&self) -> String {
         format!(
-            "# system-stats config\nwatch_dir={}\nterminal={}\n",
-            self.watch_dir.display(),
-            self.terminal.key(),
+            "# system-stats config\nwatch_dir={}\n",
+            self.watch_dir.display()
         )
     }
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            watch_dir: default_watch_dir(),
-            terminal: TerminalApp::Ghostty,
-        }
+        Self { watch_dir: default_watch_dir() }
     }
 }
 
@@ -108,13 +105,10 @@ fn parse(text: &str) -> Config {
             continue;
         }
         let Some((key, value)) = line.split_once('=') else { continue };
+        // A `terminal=` key from earlier versions falls through to the
+        // unknown-key arm and is ignored; the value is detected at launch now.
         match key.trim() {
             "watch_dir" => cfg.watch_dir = PathBuf::from(value.trim()),
-            "terminal" => {
-                if let Some(t) = TerminalApp::from_key(value.trim()) {
-                    cfg.terminal = t;
-                }
-            }
             _ => {}
         }
     }

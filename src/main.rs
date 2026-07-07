@@ -76,11 +76,10 @@ const MAIN_LABELS: [&str; 2] = ["Settings", "Exit"];
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsItem {
     WatchDir,
-    Terminal,
 }
 
-const SETTINGS_ITEMS: [SettingsItem; 2] = [SettingsItem::WatchDir, SettingsItem::Terminal];
-const SETTINGS_LABELS: [&str; 2] = ["Watch directory", "Terminal app"];
+const SETTINGS_ITEMS: [SettingsItem; 1] = [SettingsItem::WatchDir];
+const SETTINGS_LABELS: [&str; 1] = ["Watch directory"];
 
 // Small modal shown when the user hits Esc on the tab bar. Owns its own
 // cursor so nav keys can drive it independently of the pane focus underneath.
@@ -223,31 +222,6 @@ impl DirectoryPrompt {
 const EVENT_POLL: Duration = Duration::from_millis(250);
 const HEATMAP_WEEKS_MAX: usize = 27;
 
-const TERMINAL_OPTIONS: [config::TerminalApp; 3] = [
-    config::TerminalApp::Ghostty,
-    config::TerminalApp::Iterm2,
-    config::TerminalApp::TerminalApp,
-];
-
-// Modal for picking the terminal app. Second step of the first-run flow
-// (non-cancelable there, same deal as the directory prompt) and reachable
-// from Settings later (cancelable).
-struct TerminalPrompt {
-    selected: usize,
-    error: Option<String>,
-    can_cancel: bool,
-}
-
-impl TerminalPrompt {
-    fn new(current: config::TerminalApp, can_cancel: bool) -> Self {
-        let selected = TERMINAL_OPTIONS
-            .iter()
-            .position(|t| *t == current)
-            .unwrap_or(0);
-        Self { selected, error: None, can_cancel }
-    }
-}
-
 struct App {
     scanner: Scanner,
     // Persisted settings (currently just watch_dir). Kept in-memory so that
@@ -321,9 +295,10 @@ struct App {
     // above the menu stack — closing it drops the user back onto whichever
     // menu was topmost, so Esc-out-of-prompt naturally returns to Settings.
     dir_prompt: Option<DirectoryPrompt>,
-    // Terminal-app picker: step two of the first-run flow, and the
-    // Settings → Terminal app modal. Same layering rules as dir_prompt.
-    term_prompt: Option<TerminalPrompt>,
+    // The terminal emulator this session runs inside, detected fresh at
+    // every launch (never persisted, so it follows the user across
+    // terminal apps). None under tmux or editor-embedded terminals.
+    terminal: Option<config::TerminalApp>,
     should_quit: bool,
 }
 
@@ -374,7 +349,7 @@ impl App {
             claude_detail_scroll: Cell::new(0),
             menu_stack: Vec::new(),
             dir_prompt,
-            term_prompt: None,
+            terminal: config::detect_terminal(),
             should_quit: false,
         }
     }
@@ -526,6 +501,9 @@ impl App {
         let cur = self.selected_tab.index() as i32;
         let next = (cur + delta).clamp(0, n - 1) as usize;
         self.selected_tab = TABS[next];
+        // The Claude scanner runs twice as fast while its tab is showing.
+        self.claude_scanner
+            .set_focused(self.selected_tab == Tab::Claude);
     }
 
     // Entering the git-activity pane from tabs: land the cursor on the top repo
@@ -821,6 +799,36 @@ impl App {
         self.claude_session_selected = Some(order[next].clone());
     }
 
+    // Enter on a session in the detail view: open a new window in the
+    // user's terminal, cd into the project, and `claude --resume` the
+    // session. Live sessions are skipped — they're already attached in
+    // some terminal, and a second client would interleave into the same
+    // transcript.
+    fn resume_selected_session(&self) {
+        let (Some(tree), Some(pname), Some(sid)) = (
+            &self.claude_tree,
+            &self.claude_detail,
+            &self.claude_session_selected,
+        ) else {
+            return;
+        };
+        let Some(project) = tree.projects.iter().find(|p| p.name == *pname) else {
+            return;
+        };
+        let Some(session) = project.sessions.iter().find(|s| s.id == *sid) else {
+            return;
+        };
+        if session.live.is_some() {
+            return;
+        }
+        // Undetected terminal (tmux, editor-embedded) falls back to
+        // Terminal.app — always present on macOS.
+        let terminal = self
+            .terminal
+            .unwrap_or(config::TerminalApp::TerminalApp);
+        claude::resume_in_terminal(terminal, &project.path, &session.id);
+    }
+
     // The Claude tab's own interactions — the same shape as
     // handle_network_key / handle_process_key, except the detail view has
     // its own session cursor (with scroll following the selection).
@@ -843,6 +851,10 @@ impl App {
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.move_claude_session_selection(1);
+                    true
+                }
+                KeyCode::Enter => {
+                    self.resume_selected_session();
                     true
                 }
                 KeyCode::Char('q') => false,
@@ -945,10 +957,6 @@ impl App {
                         true,
                     ));
                 }
-                SettingsItem::Terminal => {
-                    self.term_prompt =
-                        Some(TerminalPrompt::new(self.config.terminal, true));
-                }
             },
         }
     }
@@ -958,9 +966,6 @@ impl App {
     // can fix it in place.
     fn submit_dir_prompt(&mut self) {
         let Some(prompt) = self.dir_prompt.as_mut() else { return };
-        // can_cancel is false only on the first-run flow — where accepting
-        // the directory leads on to the terminal picker below.
-        let first_run = !prompt.can_cancel;
         let resolved = prompt.resolved_path();
         if !resolved.is_dir() {
             prompt.error = Some(format!("not a directory: {}", resolved.display()));
@@ -1001,26 +1006,6 @@ impl App {
             self.focus = Focus::Tabs;
         }
         self.dir_prompt = None;
-        if first_run {
-            self.term_prompt = Some(TerminalPrompt::new(self.config.terminal, false));
-        }
-    }
-
-    // Commit the terminal picker: write the choice to disk. On failure the
-    // prompt stays open with the error shown, same as the directory prompt.
-    fn submit_terminal_prompt(&mut self) {
-        let Some(prompt) = &self.term_prompt else { return };
-        let choice = TERMINAL_OPTIONS[prompt.selected];
-        let mut new_config = self.config.clone();
-        new_config.terminal = choice;
-        if let Err(e) = new_config.save() {
-            if let Some(p) = self.term_prompt.as_mut() {
-                p.error = Some(format!("failed to save config: {e}"));
-            }
-            return;
-        }
-        self.config = new_config;
-        self.term_prompt = None;
     }
 
     fn handle_events(&mut self) -> std::io::Result<()> {
@@ -1035,10 +1020,6 @@ impl App {
         // wins.
         if self.dir_prompt.is_some() {
             self.handle_prompt_key(key);
-            return Ok(());
-        }
-        if self.term_prompt.is_some() {
-            self.handle_term_prompt_key(key);
             return Ok(());
         }
         if !self.menu_stack.is_empty() {
@@ -1057,30 +1038,6 @@ impl App {
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.menu_move(-1),
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.menu_move(1),
             (KeyCode::Enter, _) => self.menu_activate(),
-            _ => {}
-        }
-    }
-
-    fn handle_term_prompt_key(&mut self, key: KeyEvent) {
-        let can_cancel = self
-            .term_prompt
-            .as_ref()
-            .map(|p| p.can_cancel)
-            .unwrap_or(false);
-        match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
-            (KeyCode::Esc, _) if can_cancel => self.term_prompt = None,
-            (KeyCode::Enter, _) => self.submit_terminal_prompt(),
-            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
-                if let Some(p) = self.term_prompt.as_mut() {
-                    p.selected = p.selected.saturating_sub(1);
-                }
-            }
-            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
-                if let Some(p) = self.term_prompt.as_mut() {
-                    p.selected = (p.selected + 1).min(TERMINAL_OPTIONS.len() - 1);
-                }
-            }
             _ => {}
         }
     }
@@ -1251,82 +1208,11 @@ fn draw(f: &mut Frame, app: &App) {
     if !app.menu_stack.is_empty() {
         draw_menu(f, app);
     }
-    // Prompts draw last so they sit above the menu; the directory prompt
-    // is topmost (matches handle_events priority).
-    if app.term_prompt.is_some() {
-        draw_terminal_prompt(f, app);
-    }
+    // Drawn last so it sits above the menu; if both were ever open at
+    // once the prompt wins (matches handle_events priority).
     if app.dir_prompt.is_some() {
         draw_directory_prompt(f, app);
     }
-}
-
-// Modal for picking the terminal app: a two-option list with the same
-// cursor styling as the menu, plus the first-run/cancelable hint split
-// the directory prompt uses.
-fn draw_terminal_prompt(f: &mut Frame, app: &App) {
-    let Some(prompt) = &app.term_prompt else { return };
-
-    let width = 46;
-    let height: u16 = if prompt.error.is_some() {
-        (TERMINAL_OPTIONS.len() as u16) + 8
-    } else {
-        (TERMINAL_OPTIONS.len() as u16) + 6
-    };
-    let area = centered_rect(width, height, f.area());
-    f.render_widget(Clear, area);
-
-    let title = if prompt.can_cancel {
-        " Terminal app "
-    } else {
-        " Welcome — pick your terminal app "
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(title);
-
-    let mut lines: Vec<Line<'static>> = vec![Line::from("")];
-    for (i, term) in TERMINAL_OPTIONS.iter().enumerate() {
-        let selected = i == prompt.selected;
-        let marker = if selected { "▶ " } else { "  " };
-        let style = if selected {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        let current = if *term == app.config.terminal {
-            Span::styled("  (current)", Style::default().fg(Color::DarkGray))
-        } else {
-            Span::raw("")
-        };
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(marker.to_string(), style),
-            Span::styled(term.label().to_string(), style),
-            current,
-        ]));
-    }
-    if let Some(err) = &prompt.error {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!("  {err}"),
-            Style::default().fg(Color::Red),
-        )));
-    }
-    lines.push(Line::from(""));
-    let hint = if prompt.can_cancel {
-        "  Enter to save · Esc to cancel"
-    } else {
-        "  Enter to save · Ctrl-C to quit"
-    };
-    lines.push(Line::from(Span::styled(
-        hint,
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    let para = Paragraph::new(lines).style(Style::reset()).block(block);
-    f.render_widget(para, area);
 }
 
 // Modal for picking / changing the watched directory. Renders a text
@@ -4342,8 +4228,12 @@ fn append_claude_card(
 fn draw_claude_detail(f: &mut Frame, app: &App, project: &ProjectSessions, area: Rect) {
     let accent = app_accent(&project.name);
     let n = project.sessions.len();
+    let resume_hint = match app.terminal {
+        Some(t) => format!("Enter resume in {}", t.label()),
+        None => "Enter resume".to_string(),
+    };
     let title = format!(
-        " {} — {} · {} session{} · ↑/↓ select · ←/Esc back ",
+        " {} — {} · {} session{} · ↑/↓ select · {resume_hint} · ←/Esc back ",
         project.name,
         config::display_path(&project.path),
         n,
@@ -4438,6 +4328,19 @@ fn draw_claude_detail(f: &mut Frame, app: &App, project: &ProjectSessions, area:
         }
         if session.cost_usd >= 0.01 {
             stats.push(format_cost(session.cost_usd));
+        }
+        // Model(s) that ran the session, sans the redundant "claude-"
+        // prefix. Mixed-model sessions show the two most-used.
+        if !session.models.is_empty() {
+            let shown: Vec<&str> = session
+                .models
+                .iter()
+                .take(2)
+                .map(|(m, _)| m.strip_prefix("claude-").unwrap_or(m))
+                .collect();
+            let extra = session.models.len().saturating_sub(shown.len());
+            let more = if extra > 0 { format!(" +{extra}") } else { String::new() };
+            stats.push(format!("{}{more}", shown.join(" · ")));
         }
         if !session.tool_counts.is_empty() {
             let shown: Vec<String> = session
