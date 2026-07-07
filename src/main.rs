@@ -612,11 +612,14 @@ impl App {
                 }
                 true
             }
-            KeyCode::Enter => {
-                if self.focus != Focus::Tabs {
-                    if let Some(n) = &self.net_selected {
-                        self.net_detail = Some(n.clone());
-                    }
+            // Right mirrors Enter for drill-down, pairing with Left = back.
+            // On the tab bar, Right falls through to cycle tabs.
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if self.focus == Focus::Tabs {
+                    return key.code == KeyCode::Enter;
+                }
+                if let Some(n) = &self.net_selected {
+                    self.net_detail = Some(n.clone());
                 }
                 true
             }
@@ -629,11 +632,9 @@ impl App {
                     true
                 }
             }
-            // In-list Left/Right is meaningless (single pane) — swallow
-            // so the git-tab pane-switching semantics don't kick in.
-            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
-                self.focus != Focus::Tabs
-            }
+            // In-list Left is meaningless (single pane) — swallow so the
+            // git-tab pane-switching semantics don't kick in.
+            KeyCode::Left | KeyCode::Char('h') => self.focus != Focus::Tabs,
             _ => false,
         }
     }
@@ -716,11 +717,14 @@ impl App {
                 }
                 true
             }
-            KeyCode::Enter => {
-                if self.focus != Focus::Tabs {
-                    if let Some(n) = &self.proc_selected {
-                        self.proc_detail = Some(n.clone());
-                    }
+            // Right mirrors Enter for drill-down, pairing with Left = back.
+            // On the tab bar, Right falls through to cycle tabs.
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if self.focus == Focus::Tabs {
+                    return key.code == KeyCode::Enter;
+                }
+                if let Some(n) = &self.proc_selected {
+                    self.proc_detail = Some(n.clone());
                 }
                 true
             }
@@ -733,11 +737,9 @@ impl App {
                     true
                 }
             }
-            // In-list Left/Right is meaningless (single pane) — swallow
-            // so the git-tab pane-switching semantics don't kick in.
-            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
-                self.focus != Focus::Tabs
-            }
+            // In-list Left is meaningless (single pane) — swallow so the
+            // git-tab pane-switching semantics don't kick in.
+            KeyCode::Left | KeyCode::Char('h') => self.focus != Focus::Tabs,
             _ => false,
         }
     }
@@ -892,20 +894,23 @@ impl App {
                 }
                 true
             }
-            KeyCode::Enter => {
-                if self.focus != Focus::Tabs {
-                    if let Some(n) = &self.claude_selected {
-                        self.claude_detail = Some(n.clone());
-                        self.claude_detail_scroll.set(0);
-                        // Land the cursor on the newest session so there's
-                        // a visible selection to navigate from.
-                        self.claude_session_selected = self
-                            .claude_tree
-                            .as_ref()
-                            .and_then(|t| t.projects.iter().find(|p| p.name == *n))
-                            .and_then(|p| p.sessions.first())
-                            .map(|s| s.id.clone());
-                    }
+            // Right mirrors Enter for drill-down, pairing with Left = back.
+            // On the tab bar, Right falls through to cycle tabs.
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if self.focus == Focus::Tabs {
+                    return key.code == KeyCode::Enter;
+                }
+                if let Some(n) = &self.claude_selected {
+                    self.claude_detail = Some(n.clone());
+                    self.claude_detail_scroll.set(0);
+                    // Land the cursor on the newest session so there's
+                    // a visible selection to navigate from.
+                    self.claude_session_selected = self
+                        .claude_tree
+                        .as_ref()
+                        .and_then(|t| t.projects.iter().find(|p| p.name == *n))
+                        .and_then(|p| p.sessions.first())
+                        .map(|s| s.id.clone());
                 }
                 true
             }
@@ -918,11 +923,9 @@ impl App {
                     true
                 }
             }
-            // In-list Left/Right is meaningless (single pane) — swallow
-            // so the git-tab pane-switching semantics don't kick in.
-            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
-                self.focus != Focus::Tabs
-            }
+            // In-list Left is meaningless (single pane) — swallow so the
+            // git-tab pane-switching semantics don't kick in.
+            KeyCode::Left | KeyCode::Char('h') => self.focus != Focus::Tabs,
             _ => false,
         }
     }
