@@ -5,12 +5,49 @@ use std::path::{Path, PathBuf};
 const APP_DIR: &str = "system-stats";
 const CONFIG_FILENAME: &str = "config";
 
+// The terminal emulator used to open/attach things from inside the app.
+// Serialized by key so the config file stays human-editable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TerminalApp {
+    Ghostty,
+    Iterm2,
+    TerminalApp,
+}
+
+impl TerminalApp {
+    pub fn key(self) -> &'static str {
+        match self {
+            TerminalApp::Ghostty => "ghostty",
+            TerminalApp::Iterm2 => "iterm2",
+            TerminalApp::TerminalApp => "terminal",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TerminalApp::Ghostty => "Ghostty",
+            TerminalApp::Iterm2 => "iTerm2",
+            TerminalApp::TerminalApp => "Terminal.app",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        match s {
+            "ghostty" => Some(TerminalApp::Ghostty),
+            "iterm2" => Some(TerminalApp::Iterm2),
+            "terminal" => Some(TerminalApp::TerminalApp),
+            _ => None,
+        }
+    }
+}
+
 // Every persisted setting lives here. Add a field + a case in serialize()
 // and parse() to grow the schema; unknown keys are ignored on load so old
 // binaries survive a newer config file.
 #[derive(Clone)]
 pub struct Config {
     pub watch_dir: PathBuf,
+    pub terminal: TerminalApp,
 }
 
 impl Config {
@@ -38,15 +75,19 @@ impl Config {
 
     fn serialize(&self) -> String {
         format!(
-            "# system-stats config\nwatch_dir={}\n",
-            self.watch_dir.display()
+            "# system-stats config\nwatch_dir={}\nterminal={}\n",
+            self.watch_dir.display(),
+            self.terminal.key(),
         )
     }
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { watch_dir: default_watch_dir() }
+        Self {
+            watch_dir: default_watch_dir(),
+            terminal: TerminalApp::Ghostty,
+        }
     }
 }
 
@@ -69,6 +110,11 @@ fn parse(text: &str) -> Config {
         let Some((key, value)) = line.split_once('=') else { continue };
         match key.trim() {
             "watch_dir" => cfg.watch_dir = PathBuf::from(value.trim()),
+            "terminal" => {
+                if let Some(t) = TerminalApp::from_key(value.trim()) {
+                    cfg.terminal = t;
+                }
+            }
             _ => {}
         }
     }

@@ -76,10 +76,11 @@ const MAIN_LABELS: [&str; 2] = ["Settings", "Exit"];
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsItem {
     WatchDir,
+    Terminal,
 }
 
-const SETTINGS_ITEMS: [SettingsItem; 1] = [SettingsItem::WatchDir];
-const SETTINGS_LABELS: [&str; 1] = ["Watch directory"];
+const SETTINGS_ITEMS: [SettingsItem; 2] = [SettingsItem::WatchDir, SettingsItem::Terminal];
+const SETTINGS_LABELS: [&str; 2] = ["Watch directory", "Terminal app"];
 
 // Small modal shown when the user hits Esc on the tab bar. Owns its own
 // cursor so nav keys can drive it independently of the pane focus underneath.
@@ -222,6 +223,31 @@ impl DirectoryPrompt {
 const EVENT_POLL: Duration = Duration::from_millis(250);
 const HEATMAP_WEEKS_MAX: usize = 27;
 
+const TERMINAL_OPTIONS: [config::TerminalApp; 3] = [
+    config::TerminalApp::Ghostty,
+    config::TerminalApp::Iterm2,
+    config::TerminalApp::TerminalApp,
+];
+
+// Modal for picking the terminal app. Second step of the first-run flow
+// (non-cancelable there, same deal as the directory prompt) and reachable
+// from Settings later (cancelable).
+struct TerminalPrompt {
+    selected: usize,
+    error: Option<String>,
+    can_cancel: bool,
+}
+
+impl TerminalPrompt {
+    fn new(current: config::TerminalApp, can_cancel: bool) -> Self {
+        let selected = TERMINAL_OPTIONS
+            .iter()
+            .position(|t| *t == current)
+            .unwrap_or(0);
+        Self { selected, error: None, can_cancel }
+    }
+}
+
 struct App {
     scanner: Scanner,
     // Persisted settings (currently just watch_dir). Kept in-memory so that
@@ -282,10 +308,11 @@ struct App {
     claude_selected: Option<String>,
     claude_detail: Option<String>,
     claude_scroll: Cell<u16>,
-    // Detail-view scroll: the offset lives on App (key handler clamps it),
-    // the max is cached during draw where the rendered height is known.
-    claude_detail_scroll: u16,
-    claude_detail_max: Cell<u16>,
+    // Detail-view session cursor (by session id — stable across the
+    // recency re-sorts a live session's constant writes cause) and its
+    // draw-nudged scroll offset, mirroring the list view's pair.
+    claude_session_selected: Option<String>,
+    claude_detail_scroll: Cell<u16>,
     // Modal menu stack. Empty when no menu is showing. Esc pops one level;
     // picking an item can push another level (e.g. Main → Settings).
     // Always renders the top-of-stack; lower levels are hidden behind it.
@@ -294,6 +321,9 @@ struct App {
     // above the menu stack — closing it drops the user back onto whichever
     // menu was topmost, so Esc-out-of-prompt naturally returns to Settings.
     dir_prompt: Option<DirectoryPrompt>,
+    // Terminal-app picker: step two of the first-run flow, and the
+    // Settings → Terminal app modal. Same layering rules as dir_prompt.
+    term_prompt: Option<TerminalPrompt>,
     should_quit: bool,
 }
 
@@ -340,10 +370,11 @@ impl App {
             claude_selected: None,
             claude_detail: None,
             claude_scroll: Cell::new(0),
-            claude_detail_scroll: 0,
-            claude_detail_max: Cell::new(0),
+            claude_session_selected: None,
+            claude_detail_scroll: Cell::new(0),
             menu_stack: Vec::new(),
             dir_prompt,
+            term_prompt: None,
             should_quit: false,
         }
     }
@@ -410,6 +441,7 @@ impl App {
             if let Some(n) = &self.claude_detail {
                 if !tree.projects.iter().any(|p| p.name == *n) {
                     self.claude_detail = None;
+                    self.claude_session_selected = None;
                 }
             }
             if let Some(n) = &self.claude_selected {
@@ -417,6 +449,16 @@ impl App {
                     self.claude_selected = None;
                 }
             }
+        }
+        // A deleted transcript can't keep the session cursor either; the
+        // next arrow press re-lands on the top session.
+        if self.claude_session_selected.is_some()
+            && !self
+                .claude_detail_session_ids()
+                .iter()
+                .any(|id| Some(id) == self.claude_session_selected.as_ref())
+        {
+            self.claude_session_selected = None;
         }
     }
 
@@ -747,9 +789,41 @@ impl App {
         self.claude_selected = Some(order[next].clone());
     }
 
+    // Session ids for the project currently open in the detail view, in
+    // rendered (recency) order — what the session cursor moves through.
+    fn claude_detail_session_ids(&self) -> Vec<String> {
+        let (Some(tree), Some(name)) = (&self.claude_tree, &self.claude_detail) else {
+            return Vec::new();
+        };
+        tree.projects
+            .iter()
+            .find(|p| p.name == *name)
+            .map(|p| p.sessions.iter().map(|s| s.id.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    // Move the detail view's session cursor by `delta` positions. Same
+    // semantics as the project cursor: with nothing selected, any move
+    // lands on the top session; the ends clamp.
+    fn move_claude_session_selection(&mut self, delta: i32) {
+        let order = self.claude_detail_session_ids();
+        if order.is_empty() {
+            return;
+        }
+        let next = match self
+            .claude_session_selected
+            .as_ref()
+            .and_then(|n| order.iter().position(|o| o == n))
+        {
+            None => 0,
+            Some(i) => (i as i32 + delta).clamp(0, order.len() as i32 - 1) as usize,
+        };
+        self.claude_session_selected = Some(order[next].clone());
+    }
+
     // The Claude tab's own interactions — the same shape as
-    // handle_network_key / handle_process_key, except the detail view
-    // scrolls (a project can hold more sessions than fit on screen).
+    // handle_network_key / handle_process_key, except the detail view has
+    // its own session cursor (with scroll following the selection).
     fn handle_claude_key(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return false; // Ctrl-C etc. always reach the shared handler.
@@ -760,16 +834,15 @@ impl App {
                 // navigation, matching Enter/Right-style drill-down flows.
                 KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
                     self.claude_detail = None;
+                    self.claude_session_selected = None;
                     true
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    self.claude_detail_scroll =
-                        self.claude_detail_scroll.saturating_sub(1);
+                    self.move_claude_session_selection(-1);
                     true
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.claude_detail_scroll = (self.claude_detail_scroll + 1)
-                        .min(self.claude_detail_max.get());
+                    self.move_claude_session_selection(1);
                     true
                 }
                 KeyCode::Char('q') => false,
@@ -811,7 +884,15 @@ impl App {
                 if self.focus != Focus::Tabs {
                     if let Some(n) = &self.claude_selected {
                         self.claude_detail = Some(n.clone());
-                        self.claude_detail_scroll = 0;
+                        self.claude_detail_scroll.set(0);
+                        // Land the cursor on the newest session so there's
+                        // a visible selection to navigate from.
+                        self.claude_session_selected = self
+                            .claude_tree
+                            .as_ref()
+                            .and_then(|t| t.projects.iter().find(|p| p.name == *n))
+                            .and_then(|p| p.sessions.first())
+                            .map(|s| s.id.clone());
                     }
                 }
                 true
@@ -864,6 +945,10 @@ impl App {
                         true,
                     ));
                 }
+                SettingsItem::Terminal => {
+                    self.term_prompt =
+                        Some(TerminalPrompt::new(self.config.terminal, true));
+                }
             },
         }
     }
@@ -873,6 +958,9 @@ impl App {
     // can fix it in place.
     fn submit_dir_prompt(&mut self) {
         let Some(prompt) = self.dir_prompt.as_mut() else { return };
+        // can_cancel is false only on the first-run flow — where accepting
+        // the directory leads on to the terminal picker below.
+        let first_run = !prompt.can_cancel;
         let resolved = prompt.resolved_path();
         if !resolved.is_dir() {
             prompt.error = Some(format!("not a directory: {}", resolved.display()));
@@ -902,7 +990,8 @@ impl App {
             self.claude_selected = None;
             self.claude_detail = None;
             self.claude_scroll.set(0);
-            self.claude_detail_scroll = 0;
+            self.claude_detail_scroll.set(0);
+            self.claude_session_selected = None;
             self.scanner.set_root(resolved);
             self.git_tree = None;
             self.graph_cache.clear();
@@ -912,6 +1001,26 @@ impl App {
             self.focus = Focus::Tabs;
         }
         self.dir_prompt = None;
+        if first_run {
+            self.term_prompt = Some(TerminalPrompt::new(self.config.terminal, false));
+        }
+    }
+
+    // Commit the terminal picker: write the choice to disk. On failure the
+    // prompt stays open with the error shown, same as the directory prompt.
+    fn submit_terminal_prompt(&mut self) {
+        let Some(prompt) = &self.term_prompt else { return };
+        let choice = TERMINAL_OPTIONS[prompt.selected];
+        let mut new_config = self.config.clone();
+        new_config.terminal = choice;
+        if let Err(e) = new_config.save() {
+            if let Some(p) = self.term_prompt.as_mut() {
+                p.error = Some(format!("failed to save config: {e}"));
+            }
+            return;
+        }
+        self.config = new_config;
+        self.term_prompt = None;
     }
 
     fn handle_events(&mut self) -> std::io::Result<()> {
@@ -926,6 +1035,10 @@ impl App {
         // wins.
         if self.dir_prompt.is_some() {
             self.handle_prompt_key(key);
+            return Ok(());
+        }
+        if self.term_prompt.is_some() {
+            self.handle_term_prompt_key(key);
             return Ok(());
         }
         if !self.menu_stack.is_empty() {
@@ -944,6 +1057,30 @@ impl App {
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.menu_move(-1),
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.menu_move(1),
             (KeyCode::Enter, _) => self.menu_activate(),
+            _ => {}
+        }
+    }
+
+    fn handle_term_prompt_key(&mut self, key: KeyEvent) {
+        let can_cancel = self
+            .term_prompt
+            .as_ref()
+            .map(|p| p.can_cancel)
+            .unwrap_or(false);
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
+            (KeyCode::Esc, _) if can_cancel => self.term_prompt = None,
+            (KeyCode::Enter, _) => self.submit_terminal_prompt(),
+            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                if let Some(p) = self.term_prompt.as_mut() {
+                    p.selected = p.selected.saturating_sub(1);
+                }
+            }
+            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                if let Some(p) = self.term_prompt.as_mut() {
+                    p.selected = (p.selected + 1).min(TERMINAL_OPTIONS.len() - 1);
+                }
+            }
             _ => {}
         }
     }
@@ -1114,11 +1251,82 @@ fn draw(f: &mut Frame, app: &App) {
     if !app.menu_stack.is_empty() {
         draw_menu(f, app);
     }
-    // Drawn last so it sits above the menu; if both were ever open at
-    // once the prompt wins (matches handle_events priority).
+    // Prompts draw last so they sit above the menu; the directory prompt
+    // is topmost (matches handle_events priority).
+    if app.term_prompt.is_some() {
+        draw_terminal_prompt(f, app);
+    }
     if app.dir_prompt.is_some() {
         draw_directory_prompt(f, app);
     }
+}
+
+// Modal for picking the terminal app: a two-option list with the same
+// cursor styling as the menu, plus the first-run/cancelable hint split
+// the directory prompt uses.
+fn draw_terminal_prompt(f: &mut Frame, app: &App) {
+    let Some(prompt) = &app.term_prompt else { return };
+
+    let width = 46;
+    let height: u16 = if prompt.error.is_some() {
+        (TERMINAL_OPTIONS.len() as u16) + 8
+    } else {
+        (TERMINAL_OPTIONS.len() as u16) + 6
+    };
+    let area = centered_rect(width, height, f.area());
+    f.render_widget(Clear, area);
+
+    let title = if prompt.can_cancel {
+        " Terminal app "
+    } else {
+        " Welcome — pick your terminal app "
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+
+    let mut lines: Vec<Line<'static>> = vec![Line::from("")];
+    for (i, term) in TERMINAL_OPTIONS.iter().enumerate() {
+        let selected = i == prompt.selected;
+        let marker = if selected { "▶ " } else { "  " };
+        let style = if selected {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let current = if *term == app.config.terminal {
+            Span::styled("  (current)", Style::default().fg(Color::DarkGray))
+        } else {
+            Span::raw("")
+        };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(marker.to_string(), style),
+            Span::styled(term.label().to_string(), style),
+            current,
+        ]));
+    }
+    if let Some(err) = &prompt.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    let hint = if prompt.can_cancel {
+        "  Enter to save · Esc to cancel"
+    } else {
+        "  Enter to save · Ctrl-C to quit"
+    };
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let para = Paragraph::new(lines).style(Style::reset()).block(block);
+    f.render_widget(para, area);
 }
 
 // Modal for picking / changing the watched directory. Renders a text
@@ -1298,13 +1506,11 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     } else {
         Style::reset()
     };
-    let highlight_style = if focused {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().add_modifier(Modifier::BOLD)
-    };
+    // The border tracks focus, but the active tab's label stays cyan
+    // either way — it's the "you are here" marker, not a focus marker.
+    let highlight_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let titles: Vec<Line> = TAB_LABELS
         .iter()
         .map(|s| Line::from(Span::raw(*s)))
@@ -3838,6 +4044,17 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
+// API-equivalent cost → "~$0.42" / "~$34" — the tilde signals it's an
+// estimate (computed from usage at published API rates, notional for
+// subscription plans). Cents only matter under ten dollars.
+fn format_cost(usd: f64) -> String {
+    if usd < 10.0 {
+        format!("~${usd:.2}")
+    } else {
+        format!("~${usd:.0}")
+    }
+}
+
 // Seconds → "40s" / "45m" / "12h 47m" — wall-clock span, so hours matter
 // but sub-minute precision doesn't once past the first minute.
 fn format_duration(secs: u64) -> String {
@@ -3912,8 +4129,13 @@ fn draw_claude_list(f: &mut Frame, app: &App, tree: &ClaudeTree, area: Rect) {
     } else {
         ""
     };
+    let cost_part = if tree.total_cost_usd >= 0.01 {
+        format!(" · {}", format_cost(tree.total_cost_usd))
+    } else {
+        String::new()
+    };
     let title = format!(
-        " Claude — {} project{} · {} session{}{live_part} · scanned {rounded}s ago{hint} ",
+        " Claude — {} project{} · {} session{}{cost_part}{live_part} · scanned {rounded}s ago{hint} ",
         tree.projects.len(),
         if tree.projects.len() == 1 { "" } else { "s" },
         tree.total_sessions,
@@ -4000,11 +4222,18 @@ fn append_claude_card(
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!(
-                "   {} session{} · {age_str}",
-                project.sessions.len(),
-                if project.sessions.len() == 1 { "" } else { "s" },
-            ),
+            {
+                let cost_part = if project.total_cost_usd >= 0.01 {
+                    format!(" · {}", format_cost(project.total_cost_usd))
+                } else {
+                    String::new()
+                };
+                format!(
+                    "   {} session{}{cost_part} · {age_str}",
+                    project.sessions.len(),
+                    if project.sessions.len() == 1 { "" } else { "s" },
+                )
+            },
             Style::default().fg(Color::DarkGray),
         ),
     ];
@@ -4114,7 +4343,7 @@ fn draw_claude_detail(f: &mut Frame, app: &App, project: &ProjectSessions, area:
     let accent = app_accent(&project.name);
     let n = project.sessions.len();
     let title = format!(
-        " {} — {} · {} session{} · ↑/↓ scroll · Esc to close ",
+        " {} — {} · {} session{} · ↑/↓ select · ←/Esc back ",
         project.name,
         config::display_path(&project.path),
         n,
@@ -4135,15 +4364,31 @@ fn draw_claude_detail(f: &mut Frame, app: &App, project: &ProjectSessions, area:
         .unwrap_or(0);
 
     let mut lines: Vec<Line<'static>> = vec![Line::from("")];
+    // (start_line, height) of the selected session's block, for
+    // scroll-into-view — same pattern as the app-card lists.
+    let mut selected_extent: Option<(u16, u16)> = None;
     for session in &project.sessions {
+        let selected =
+            app.claude_session_selected.as_deref() == Some(session.id.as_str());
+        let start = lines.len() as u16;
+        let marker: Span<'static> = if selected {
+            Span::styled("▶ ", Style::default().fg(Color::Cyan))
+        } else {
+            Span::raw("  ")
+        };
         let (s_bullet, s_color) = claude_session_bullet(session, now);
+        let title_style = if selected {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)
+        };
         lines.push(Line::from(vec![
-            Span::raw("  "),
+            marker,
             Span::styled(s_bullet.to_string(), Style::default().fg(s_color)),
             Span::raw(" "),
             Span::styled(
                 truncate(&claude_session_title(session), inner_width.saturating_sub(6)),
-                Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD),
+                title_style,
             ),
         ]));
 
@@ -4191,6 +4436,9 @@ fn draw_claude_detail(f: &mut Frame, app: &App, project: &ProjectSessions, area:
         if session.output_tokens > 0 {
             stats.push(format!("{} out", format_tokens(session.output_tokens)));
         }
+        if session.cost_usd >= 0.01 {
+            stats.push(format_cost(session.cost_usd));
+        }
         if !session.tool_counts.is_empty() {
             let shown: Vec<String> = session
                 .tool_counts
@@ -4225,6 +4473,9 @@ fn draw_claude_detail(f: &mut Frame, app: &App, project: &ProjectSessions, area:
             ]));
         }
         lines.push(Line::from(""));
+        if selected {
+            selected_extent = Some((start, lines.len() as u16 - start));
+        }
     }
     if project.sessions.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -4233,11 +4484,12 @@ fn draw_claude_detail(f: &mut Frame, app: &App, project: &ProjectSessions, area:
         )));
     }
 
-    // Cache the max offset so the key handler can clamp; render clamps
-    // again in case the pane shrank since the last keypress.
-    let max_scroll = (lines.len() as u16).saturating_sub(inner_height);
-    app.claude_detail_max.set(max_scroll);
-    let scroll = app.claude_detail_scroll.min(max_scroll);
+    let scroll = scroll_into_view(
+        &app.claude_detail_scroll,
+        selected_extent,
+        lines.len() as u16,
+        inner_height,
+    );
 
     let para = Paragraph::new(lines)
         .style(Style::reset())

@@ -40,6 +40,7 @@ pub struct ClaudeTree {
     pub projects: Vec<ProjectSessions>,
     pub total_sessions: usize,
     pub live_count: usize,
+    pub total_cost_usd: f64,
     pub scanned_at: Instant,
 }
 
@@ -50,6 +51,7 @@ pub struct ProjectSessions {
     pub sessions: Vec<SessionInfo>,
     // Epoch seconds of the most recent session activity.
     pub last_activity: Option<u64>,
+    pub total_cost_usd: f64,
 }
 
 #[derive(Clone)]
@@ -71,6 +73,10 @@ pub struct SessionInfo {
     // Total output tokens across the session's assistant messages —
     // a "how much work happened here" number.
     pub output_tokens: u64,
+    // API-equivalent cost in USD, computed from each message's usage block
+    // and the MODEL_RATES table. Notional for subscription users — what the
+    // same usage would have billed at API rates.
+    pub cost_usd: f64,
     // Tool invocations by name, most-used first — the session's activity
     // profile (lots of Edit = building, lots of WebSearch = research).
     pub tool_counts: Vec<(String, u32)>,
@@ -147,6 +153,48 @@ struct CacheEntry {
     parsed: ParsedTranscript,
 }
 
+// One assistant message's token usage, from its `usage` block.
+#[derive(Clone, Copy, Default)]
+struct MsgUsage {
+    input: u64,
+    output: u64,
+    cache_write: u64,
+    cache_read: u64,
+}
+
+// API pricing in USD per million tokens (input, output), matched by model-id
+// prefix so new versions within a family inherit their tier's rates. Cache
+// writes bill at 1.25 × input (5-minute TTL assumed — 1-hour writes are 2×,
+// so this can slightly underestimate) and cache reads at 0.1 × input.
+// Prices change occasionally; update alongside Anthropic's published
+// pricing. Cached 2026-07.
+const MODEL_RATES: [(&str, f64, f64); 5] = [
+    ("claude-fable", 10.0, 50.0),
+    ("claude-mythos", 10.0, 50.0),
+    ("claude-opus", 5.0, 25.0),
+    ("claude-sonnet", 3.0, 15.0),
+    ("claude-haiku", 1.0, 5.0),
+];
+
+fn model_rates(model: &str) -> (f64, f64) {
+    for (prefix, input, output) in MODEL_RATES {
+        if model.starts_with(prefix) {
+            return (input, output);
+        }
+    }
+    // Unknown model — assume Opus-tier rather than pricing it at zero.
+    (5.0, 25.0)
+}
+
+fn usage_cost(model: &str, u: &MsgUsage) -> f64 {
+    let (input_rate, output_rate) = model_rates(model);
+    (u.input as f64 * input_rate
+        + u.output as f64 * output_rate
+        + u.cache_write as f64 * input_rate * 1.25
+        + u.cache_read as f64 * input_rate * 0.10)
+        / 1e6
+}
+
 #[derive(Clone, Default)]
 struct ParsedTranscript {
     // First typed prompt — the fallback title for older transcripts.
@@ -159,6 +207,7 @@ struct ParsedTranscript {
     git_branch: Option<String>,
     duration_secs: u64,
     output_tokens: u64,
+    cost_usd: f64,
     tool_counts: Vec<(String, u32)>,
 }
 
@@ -224,6 +273,7 @@ fn scan(root: &Path, cache: &mut HashMap<PathBuf, CacheEntry>) -> ClaudeTree {
                     git_branch: parsed.git_branch,
                     duration_secs: parsed.duration_secs,
                     output_tokens: parsed.output_tokens,
+                    cost_usd: parsed.cost_usd,
                     tool_counts: parsed.tool_counts,
                 });
             }
@@ -236,7 +286,14 @@ fn scan(root: &Path, cache: &mut HashMap<PathBuf, CacheEntry>) -> ClaudeTree {
                     .then_with(|| a.id.cmp(&b.id))
             });
             let last_activity = sessions.iter().map(|s| s.last_activity).max();
-            projects.push(ProjectSessions { name, path, sessions, last_activity });
+            let total_cost_usd = sessions.iter().map(|s| s.cost_usd).sum();
+            projects.push(ProjectSessions {
+                name,
+                path,
+                sessions,
+                last_activity,
+                total_cost_usd,
+            });
         }
         // Entries for deleted transcripts (or a changed root) fall away here.
         *cache = fresh;
@@ -253,6 +310,7 @@ fn scan(root: &Path, cache: &mut HashMap<PathBuf, CacheEntry>) -> ClaudeTree {
         .flat_map(|p| &p.sessions)
         .filter(|s| s.live.is_some())
         .count();
+    let total_cost_usd = projects.iter().map(|p| p.total_cost_usd).sum();
 
     ClaudeTree {
         root: root.to_path_buf(),
@@ -260,6 +318,7 @@ fn scan(root: &Path, cache: &mut HashMap<PathBuf, CacheEntry>) -> ClaudeTree {
         projects,
         total_sessions,
         live_count,
+        total_cost_usd,
         scanned_at: Instant::now(),
     }
 }
@@ -338,8 +397,9 @@ fn parse_transcript_text(text: &str) -> ParsedTranscript {
     // carrying the same message id and a usage snapshot — summing lines
     // naively would count one message several times over. Dedupe by
     // message id (last snapshot wins) and by tool-use id.
-    let mut tokens_by_msg: HashMap<String, u64> = HashMap::new();
+    let mut usage_by_msg: HashMap<String, (String, MsgUsage)> = HashMap::new();
     let mut stray_tokens: u64 = 0;
+    let mut stray_cost: f64 = 0.0;
     let mut seen_tool_ids: HashSet<String> = HashSet::new();
     let mut tool_counts: HashMap<String, u32> = HashMap::new();
     let mut first_ts: Option<u64> = None;
@@ -380,12 +440,22 @@ fn parse_transcript_text(text: &str) -> ParsedTranscript {
             // tokens and tool calls measure total work done, unlike the
             // prompt count below which measures the human conversation.
             if line.contains("\"output_tokens\":") {
-                if let Some(tok) = json_u64(line, "output_tokens") {
-                    match message_id(line) {
-                        Some(id) => {
-                            tokens_by_msg.insert(id, tok);
-                        }
-                        None => stray_tokens += tok,
+                let usage = MsgUsage {
+                    input: json_u64(line, "input_tokens").unwrap_or(0),
+                    output: json_u64(line, "output_tokens").unwrap_or(0),
+                    cache_write: json_u64(line, "cache_creation_input_tokens")
+                        .unwrap_or(0),
+                    cache_read: json_u64(line, "cache_read_input_tokens")
+                        .unwrap_or(0),
+                };
+                let model = json_str(line, "model").unwrap_or_default();
+                match message_id(line) {
+                    Some(id) => {
+                        usage_by_msg.insert(id, (model, usage));
+                    }
+                    None => {
+                        stray_tokens += usage.output;
+                        stray_cost += usage_cost(&model, &usage);
                     }
                 }
             }
@@ -428,7 +498,12 @@ fn parse_transcript_text(text: &str) -> ParsedTranscript {
         }
     }
 
-    out.output_tokens = tokens_by_msg.values().sum::<u64>() + stray_tokens;
+    out.output_tokens = stray_tokens;
+    out.cost_usd = stray_cost;
+    for (model, usage) in usage_by_msg.values() {
+        out.output_tokens += usage.output;
+        out.cost_usd += usage_cost(model, usage);
+    }
     out.duration_secs = match (first_ts, last_ts) {
         (Some(a), Some(b)) => b.saturating_sub(a),
         _ => 0,
@@ -648,7 +723,7 @@ mod tests {
         "\n",
         r#"{"type":"assistant","message":{"model":"claude-opus-4-8","id":"msg_01AAA","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}],"usage":{"input_tokens":10,"output_tokens":100}},"timestamp":"2026-07-06T05:59:00.000Z"}"#,
         "\n",
-        r#"{"type":"assistant","message":{"model":"claude-opus-4-8","id":"msg_01AAA","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}},{"type":"tool_use","id":"toolu_2","name":"Edit","input":{}}],"usage":{"input_tokens":10,"output_tokens":150}},"timestamp":"2026-07-06T05:59:10.000Z"}"#,
+        r#"{"type":"assistant","message":{"model":"claude-opus-4-8","id":"msg_01AAA","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}},{"type":"tool_use","id":"toolu_2","name":"Edit","input":{}}],"usage":{"input_tokens":10,"cache_creation_input_tokens":1000,"cache_read_input_tokens":10000,"output_tokens":150}},"timestamp":"2026-07-06T05:59:10.000Z"}"#,
         "\n",
         r#"{"type":"assistant","message":{"model":"claude-fable-5","id":"msg_01BBB","role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":5,"output_tokens":50}},"timestamp":"2026-07-06T06:58:14.000Z"}"#,
         "\n",
@@ -672,6 +747,26 @@ mod tests {
         // msg_01AAA appears twice (100 then 150): the final snapshot
         // counts once. Plus msg_01BBB's 50.
         assert_eq!(p.output_tokens, 200);
+    }
+
+    #[test]
+    fn costs_priced_per_model_with_cache_rates() {
+        let p = parse_transcript_text(RICH_TRANSCRIPT);
+        // msg_01AAA (Opus, $5/$25, final snapshot wins):
+        //   10 in + 150 out + 1000 cache-write (1.25×) + 10000 cache-read (0.1×)
+        //   = (50 + 3750 + 6250 + 5000) / 1e6 = 0.01505
+        // msg_01BBB (Fable, $10/$50): (5·10 + 50·50) / 1e6 = 0.00255
+        assert!((p.cost_usd - 0.01760).abs() < 1e-9, "got {}", p.cost_usd);
+    }
+
+    #[test]
+    fn model_rates_match_by_family_prefix() {
+        assert_eq!(model_rates("claude-fable-5"), (10.0, 50.0));
+        assert_eq!(model_rates("claude-opus-4-8"), (5.0, 25.0));
+        assert_eq!(model_rates("claude-sonnet-5"), (3.0, 15.0));
+        assert_eq!(model_rates("claude-haiku-4-5-20251001"), (1.0, 5.0));
+        // Unknown models price at Opus tier rather than zero.
+        assert_eq!(model_rates("claude-next-99"), (5.0, 25.0));
     }
 
     #[test]
