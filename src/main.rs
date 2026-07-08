@@ -62,6 +62,8 @@ impl Tab {
 enum MenuKind {
     Main,
     Settings,
+    // Actions for a selected git repo — Enter on the Git tab pushes this.
+    RepoAction,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -81,6 +83,18 @@ enum SettingsItem {
 const SETTINGS_ITEMS: [SettingsItem; 1] = [SettingsItem::WatchDir];
 const SETTINGS_LABELS: [&str; 1] = ["Watch directory"];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RepoActionItem {
+    // Open a plain terminal at the repo dir.
+    Terminal,
+    // Open a terminal at the repo dir and start a fresh `claude` session.
+    Claude,
+}
+
+const REPO_ACTION_ITEMS: [RepoActionItem; 2] =
+    [RepoActionItem::Terminal, RepoActionItem::Claude];
+const REPO_ACTION_LABELS: [&str; 2] = ["Open terminal here", "New Claude session"];
+
 // Small modal shown when the user hits Esc on the tab bar. Owns its own
 // cursor so nav keys can drive it independently of the pane focus underneath.
 struct Menu {
@@ -91,11 +105,13 @@ struct Menu {
 impl Menu {
     fn main() -> Self { Self { kind: MenuKind::Main, selected: 0 } }
     fn settings() -> Self { Self { kind: MenuKind::Settings, selected: 0 } }
+    fn repo_action() -> Self { Self { kind: MenuKind::RepoAction, selected: 0 } }
 
     fn labels(&self) -> &'static [&'static str] {
         match self.kind {
             MenuKind::Main => &MAIN_LABELS,
             MenuKind::Settings => &SETTINGS_LABELS,
+            MenuKind::RepoAction => &REPO_ACTION_LABELS,
         }
     }
 
@@ -103,6 +119,7 @@ impl Menu {
         match self.kind {
             MenuKind::Main => " Menu — Esc to close ",
             MenuKind::Settings => " Settings — Esc back ",
+            MenuKind::RepoAction => " Open — Esc to close ",
         }
     }
 }
@@ -961,6 +978,31 @@ impl App {
                     ));
                 }
             },
+            MenuKind::RepoAction => {
+                // Resolve the selected repo's path fresh — a rescan could
+                // have dropped it while the menu was open. Reuse the same
+                // detected-terminal fallback as the Claude-resume path.
+                let path = self
+                    .git_tree
+                    .as_ref()
+                    .zip(self.selected_repo)
+                    .and_then(|(tree, i)| tree.repos.get(i))
+                    .map(|r| r.path.clone());
+                if let Some(path) = path {
+                    let terminal =
+                        self.terminal.unwrap_or(config::TerminalApp::TerminalApp);
+                    match REPO_ACTION_ITEMS[selected] {
+                        RepoActionItem::Terminal => {
+                            claude::open_in_terminal(terminal, &path, None);
+                        }
+                        RepoActionItem::Claude => {
+                            claude::open_in_terminal(terminal, &path, Some("claude"));
+                        }
+                    }
+                }
+                // Single-level menu — pop it so we return to the Git tab.
+                self.menu_stack.pop();
+            }
         }
     }
 
@@ -1165,6 +1207,17 @@ impl App {
                 Focus::Right => self.move_selection(1),
                 Focus::Left => self.scroll_left_pane(1),
             },
+            // Enter on a selected git repo (in either pane) pops the
+            // open-in-terminal / new-Claude-session chooser. Inert on the
+            // tab bar and when the "my activity" overview is selected.
+            (KeyCode::Enter, _) => {
+                if self.selected_tab == Tab::GitStatus
+                    && self.focus != Focus::Tabs
+                    && self.selected_repo.is_some()
+                {
+                    self.menu_stack.push(Menu::repo_action());
+                }
+            }
             _ => {}
         }
     }

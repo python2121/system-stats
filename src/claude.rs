@@ -355,49 +355,59 @@ fn claude_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude"))
 }
 
-// Open a new window in the user's terminal app, cd into the project, and
-// re-attach to a session with `claude --resume`. Fire-and-forget: the
-// launcher process is spawned detached and failures are silent — the new
-// window (or its absence) is its own feedback.
-pub fn resume_in_terminal(
+// Open a new window in the user's terminal app, cd into `dir`, and
+// optionally run `command` there. When `command` is None the window is
+// left at a plain interactive shell; when Some it's typed into the shell
+// and run after the `cd`, leaving the shell behind when it exits. The
+// string must already be shell-ready (quoted as needed) — it's dropped in
+// verbatim. Fire-and-forget: the launcher process is spawned detached and
+// failures are silent — the new window (or its absence) is its own feedback.
+pub fn open_in_terminal(
     terminal: config::TerminalApp,
-    project_dir: &Path,
-    session_id: &str,
+    dir: &Path,
+    command: Option<&str>,
 ) {
-    let dir = project_dir.display().to_string();
-    let shell_cmd = format!(
-        "cd {} && claude --resume {}",
-        shell_quote(&dir),
-        shell_quote(session_id),
-    );
+    let dir = dir.display().to_string();
+    // iTerm/Terminal run a single line in a fresh shell: cd first, then the
+    // optional command joined with `&&` so it only runs if the cd succeeds.
+    let shell_cmd = match command {
+        Some(c) => format!("cd {} && {}", shell_quote(&dir), c),
+        None => format!("cd {}", shell_quote(&dir)),
+    };
 
     let mut cmd = match terminal {
         // Ghostty ≥ 1.3 ships an AppleScript dictionary. Scripting the
         // running app avoids `open -na`, which spawns a whole second app
         // instance; and typing the command via `initial input` (rather
         // than `command`, which replaces the shell) leaves a normal
-        // interactive shell behind when the claude session ends.
+        // interactive shell behind when the command ends.
         config::TerminalApp::Ghostty => {
+            // Ghostty takes the working dir as config; only the command (if
+            // any) is typed into the shell, so no `cd` line is needed here.
+            let input_line = match command {
+                Some(c) => format!(
+                    "set initial input of cfg to \"{}\" & linefeed\n",
+                    applescript_escape(c),
+                ),
+                None => String::new(),
+            };
             let script = format!(
                 "tell application \"Ghostty\"\n\
                  activate\n\
                  set cfg to new surface configuration\n\
                  set initial working directory of cfg to \"{}\"\n\
-                 set initial input of cfg to \"{}\" & linefeed\n\
+                 {}\
                  new window with configuration cfg\n\
                  end tell",
                 applescript_escape(&dir),
-                applescript_escape(&format!(
-                    "claude --resume {}",
-                    shell_quote(session_id),
-                )),
+                input_line,
             );
             let mut c = Command::new("osascript");
             c.args(["-e", &script]);
             c
         }
         // iTerm: create a window, then type the command into its shell —
-        // the window survives after the claude session ends.
+        // the window survives after the command ends.
         config::TerminalApp::Iterm2 => {
             let script = format!(
                 "tell application \"iTerm\"\n\
@@ -433,6 +443,17 @@ pub fn resume_in_terminal(
             let _ = child.wait();
         });
     }
+}
+
+// Open a new terminal window, cd into the project, and re-attach to a
+// session with `claude --resume`. Thin wrapper over open_in_terminal.
+pub fn resume_in_terminal(
+    terminal: config::TerminalApp,
+    project_dir: &Path,
+    session_id: &str,
+) {
+    let command = format!("claude --resume {}", shell_quote(session_id));
+    open_in_terminal(terminal, project_dir, Some(&command));
 }
 
 // Single-quote for POSIX shells: '…' with embedded quotes as '\''.
