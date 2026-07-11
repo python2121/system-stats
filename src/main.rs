@@ -619,10 +619,13 @@ impl App {
         }
         match key.code {
             // Left mirrors Esc: "go back up a level", matching the other
-            // drill-down flows.
+            // drill-down flows. Always land on the git-activity list —
+            // even when inspect was entered from the graph pane — so Esc
+            // consistently returns to repo navigation.
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
                 self.git_inspect = None;
                 self.inspect_scroll = 0;
+                self.enter_right_pane();
                 true
             }
             KeyCode::Up | KeyCode::Char('k') => {
