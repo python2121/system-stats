@@ -89,11 +89,14 @@ enum RepoActionItem {
     Terminal,
     // Open a terminal at the repo dir and start a fresh `claude` session.
     Claude,
+    // Full-screen detailed commit graph for the repo.
+    Inspect,
 }
 
-const REPO_ACTION_ITEMS: [RepoActionItem; 2] =
-    [RepoActionItem::Terminal, RepoActionItem::Claude];
-const REPO_ACTION_LABELS: [&str; 2] = ["Open terminal here", "New Claude session"];
+const REPO_ACTION_ITEMS: [RepoActionItem; 3] =
+    [RepoActionItem::Terminal, RepoActionItem::Claude, RepoActionItem::Inspect];
+const REPO_ACTION_LABELS: [&str; 3] =
+    ["Open terminal here", "New Claude session", "Inspect git"];
 
 // Small modal shown when the user hits Esc on the tab bar. Owns its own
 // cursor so nav keys can drive it independently of the pane focus underneath.
@@ -251,6 +254,18 @@ struct App {
     // Cached commit graphs keyed by repo name. Cleared when a new scan arrives
     // so a deleted/added repo can't show stale lines.
     graph_cache: HashMap<String, Vec<GraphRow>>,
+    // Per-commit diff stats keyed by repo name (then by sha), for the inspect
+    // view. Same lifecycle as graph_cache.
+    stats_cache: HashMap<String, HashMap<String, git::CommitStat>>,
+    // When Some, the Git tab shows a full-screen detailed graph for this
+    // repo (by name — stable across the re-sorts a rescan can cause).
+    // Esc drops back to the normal three-pane layout.
+    git_inspect: Option<String>,
+    // Scroll offset for the inspect view, clamped against the size cached
+    // by the last draw (same pattern as the left graph pane).
+    inspect_scroll: u16,
+    inspect_content_lines: Cell<u16>,
+    inspect_inner_height: Cell<u16>,
     // Which zone responds to Up/Down/Left/Right.
     focus: Focus,
     // Which top-level tab is active.
@@ -339,6 +354,11 @@ impl App {
             git_tree: None,
             selected_repo: None,
             graph_cache: HashMap::new(),
+            stats_cache: HashMap::new(),
+            git_inspect: None,
+            inspect_scroll: 0,
+            inspect_content_lines: Cell::new(0),
+            inspect_inner_height: Cell::new(0),
             focus: Focus::Tabs,
             selected_tab: Tab::GitStatus,
             left_scroll: 0,
@@ -469,7 +489,19 @@ impl App {
         }
         if got_new {
             self.graph_cache.clear();
+            self.stats_cache.clear();
             self.clamp_selection();
+            // A repo that vanished from the new scan can't stay inspected.
+            let gone = self
+                .git_inspect
+                .as_ref()
+                .zip(self.git_tree.as_ref())
+                .map(|(name, tree)| !tree.repos.iter().any(|r| r.name == *name))
+                .unwrap_or(false);
+            if gone {
+                self.git_inspect = None;
+                self.inspect_scroll = 0;
+            }
             // Don't reset left_scroll — the user may be mid-pan in the graph.
             // Scroll only resets on selection change (see move_selection / Esc).
             // If the new graph is shorter than the current offset, the next
@@ -538,16 +570,80 @@ impl App {
     }
 
     // Lazily fetch + cache the commit graph for the selected repo so we only
-    // shell out to git when the user actually navigates to it.
+    // shell out to git when the user actually navigates to it. The inspect
+    // view is keyed by name, which can diverge from the selected index after
+    // a rescan re-sorts the list, so it resolves its repo (and its diff
+    // stats) independently.
     fn ensure_graph_loaded(&mut self) {
         let Some(tree) = &self.git_tree else { return };
-        let Some(idx) = self.selected_repo else { return };
-        let Some(repo) = tree.repos.get(idx) else { return };
-        if self.graph_cache.contains_key(&repo.name) {
-            return;
+        let mut wanted: Vec<(String, PathBuf)> = Vec::new();
+        if let Some(repo) = self.selected_repo.and_then(|i| tree.repos.get(i)) {
+            wanted.push((repo.name.clone(), repo.path.clone()));
         }
-        let rows = git::graph(&repo.path);
-        self.graph_cache.insert(repo.name.clone(), rows);
+        if let Some(name) = &self.git_inspect {
+            if let Some(repo) = tree.repos.iter().find(|r| r.name == *name) {
+                wanted.push((repo.name.clone(), repo.path.clone()));
+            }
+        }
+        for (name, path) in wanted {
+            if !self.graph_cache.contains_key(&name) {
+                self.graph_cache.insert(name.clone(), git::graph(&path));
+            }
+            // Stats are only needed (and only paid for) by the inspect view.
+            if self.git_inspect.as_deref() == Some(name.as_str())
+                && !self.stats_cache.contains_key(&name)
+            {
+                self.stats_cache.insert(name, git::commit_stats(&path));
+            }
+        }
+    }
+
+    fn scroll_inspect(&mut self, delta: i32) {
+        let max = self
+            .inspect_content_lines
+            .get()
+            .saturating_sub(self.inspect_inner_height.get());
+        self.inspect_scroll =
+            (self.inspect_scroll as i32 + delta).clamp(0, max as i32) as u16;
+    }
+
+    // The inspect view's own interactions — same shape as the other tabs'
+    // detail views: Esc/Left closes, Up/Down scrolls, everything except
+    // quit is inert. Returns false when the view isn't open.
+    fn handle_git_inspect_key(&mut self, key: KeyEvent) -> bool {
+        if self.git_inspect.is_none() {
+            return false;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return false; // Ctrl-C etc. always reach the shared handler.
+        }
+        match key.code {
+            // Left mirrors Esc: "go back up a level", matching the other
+            // drill-down flows.
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
+                self.git_inspect = None;
+                self.inspect_scroll = 0;
+                true
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.scroll_inspect(-1);
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.scroll_inspect(1);
+                true
+            }
+            KeyCode::PageUp => {
+                self.scroll_inspect(-(self.inspect_inner_height.get().max(1) as i32));
+                true
+            }
+            KeyCode::PageDown => {
+                self.scroll_inspect(self.inspect_inner_height.get().max(1) as i32);
+                true
+            }
+            KeyCode::Char('q') => false,
+            _ => true,
+        }
     }
 
     fn net_sorted_names(&self) -> Vec<String> {
@@ -979,16 +1075,16 @@ impl App {
                 }
             },
             MenuKind::RepoAction => {
-                // Resolve the selected repo's path fresh — a rescan could
-                // have dropped it while the menu was open. Reuse the same
+                // Resolve the selected repo fresh — a rescan could have
+                // dropped it while the menu was open. Reuse the same
                 // detected-terminal fallback as the Claude-resume path.
-                let path = self
+                let repo = self
                     .git_tree
                     .as_ref()
                     .zip(self.selected_repo)
                     .and_then(|(tree, i)| tree.repos.get(i))
-                    .map(|r| r.path.clone());
-                if let Some(path) = path {
+                    .map(|r| (r.name.clone(), r.path.clone()));
+                if let Some((name, path)) = repo {
                     let terminal =
                         self.terminal.unwrap_or(config::TerminalApp::TerminalApp);
                     match REPO_ACTION_ITEMS[selected] {
@@ -997,6 +1093,13 @@ impl App {
                         }
                         RepoActionItem::Claude => {
                             claude::open_in_terminal(terminal, &path, Some("claude"));
+                        }
+                        RepoActionItem::Inspect => {
+                            // Graph + stats load lazily via ensure_graph_loaded
+                            // on the next tick; a "loading …" frame shows if
+                            // they aren't cached yet.
+                            self.git_inspect = Some(name);
+                            self.inspect_scroll = 0;
                         }
                     }
                 }
@@ -1045,7 +1148,10 @@ impl App {
             self.scanner.set_root(resolved);
             self.git_tree = None;
             self.graph_cache.clear();
+            self.stats_cache.clear();
             self.selected_repo = None;
+            self.git_inspect = None;
+            self.inspect_scroll = 0;
             self.left_scroll = 0;
             self.right_scroll.set(0);
             self.focus = Focus::Tabs;
@@ -1142,6 +1248,11 @@ impl App {
     }
 
     fn handle_main_key(&mut self, key: KeyEvent) {
+        // The full-screen inspect view swallows everything except quit
+        // while it's open.
+        if self.selected_tab == Tab::GitStatus && self.handle_git_inspect_key(key) {
+            return;
+        }
         // The network tab has its own selection/detail interactions; keys
         // it doesn't consume (quit, tab cycling, menu) fall through to
         // the shared handling below.
@@ -1207,15 +1318,29 @@ impl App {
                 Focus::Right => self.move_selection(1),
                 Focus::Left => self.scroll_left_pane(1),
             },
-            // Enter on a selected git repo (in either pane) pops the
-            // open-in-terminal / new-Claude-session chooser. Inert on the
-            // tab bar and when the "my activity" overview is selected.
+            // Enter on a selected git repo: from the activity list it pops
+            // the action chooser; from the graph pane it drills straight
+            // into the full-screen inspect view — the graph is already
+            // what you're looking at, so no menu detour. Inert on the tab
+            // bar and when the "my activity" overview is selected.
             (KeyCode::Enter, _) => {
-                if self.selected_tab == Tab::GitStatus
-                    && self.focus != Focus::Tabs
-                    && self.selected_repo.is_some()
-                {
-                    self.menu_stack.push(Menu::repo_action());
+                if self.selected_tab == Tab::GitStatus && self.selected_repo.is_some() {
+                    match self.focus {
+                        Focus::Left => {
+                            let name = self
+                                .git_tree
+                                .as_ref()
+                                .zip(self.selected_repo)
+                                .and_then(|(tree, i)| tree.repos.get(i))
+                                .map(|r| r.name.clone());
+                            if let Some(name) = name {
+                                self.git_inspect = Some(name);
+                                self.inspect_scroll = 0;
+                            }
+                        }
+                        Focus::Right => self.menu_stack.push(Menu::repo_action()),
+                        Focus::Tabs => {}
+                    }
                 }
             }
             _ => {}
@@ -1426,6 +1551,12 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 }
 
 fn draw_git_status(f: &mut Frame, app: &App, area: Rect) {
+    // The inspect view replaces the whole tab body, like the other tabs'
+    // full-screen detail views.
+    if let Some(name) = &app.git_inspect {
+        draw_git_inspect(f, app, area, name);
+        return;
+    }
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
@@ -1703,7 +1834,11 @@ fn draw_graph(f: &mut Frame, app: &App, area: Rect) {
     let (title, lines): (String, Vec<Line<'static>>) = match (&app.git_tree, app.selected_repo) {
         (Some(tree), Some(idx)) if idx < tree.repos.len() => {
             let repo = &tree.repos[idx];
-            let hint = if focused { " (↑/↓ scroll · Esc back) " } else { " (Esc back) " };
+            let hint = if focused {
+                " (↑/↓ scroll · Enter inspect · Esc back) "
+            } else {
+                " (Esc back) "
+            };
             let title = format!(" Graph — {}  {hint}", repo.name);
             let lines = match app.graph_cache.get(&repo.name) {
                 Some(rows) => render_graph(rows),
@@ -1834,6 +1969,28 @@ fn beautify_glyph(ch: char, is_merge: bool) -> char {
     }
 }
 
+// Color one row's raw `git log --graph` prefix — ASCII glyphs swapped for
+// Unicode box-drawing siblings, colored by column so each lane reads as a
+// distinct swim lane. Shared by the compact and inspect graph renderers.
+fn graph_prefix_spans(row: &GraphRow) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, ch) in row.prefix.chars().enumerate() {
+        if ch == ' ' {
+            spans.push(Span::raw(" "));
+            continue;
+        }
+        let glyph = beautify_glyph(ch, row.is_merge);
+        let mut style = Style::default().fg(glyph_color(i, ch));
+        // Commit nodes are the visual anchors — bold makes them pop
+        // above the lane rails without changing width.
+        if ch == '*' {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        spans.push(Span::styled(glyph.to_string(), style));
+    }
+    spans
+}
+
 fn render_graph(rows: &[GraphRow]) -> Vec<Line<'static>> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1842,23 +1999,7 @@ fn render_graph(rows: &[GraphRow]) -> Vec<Line<'static>> {
 
     rows.iter()
         .map(|row| {
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            // Graph drawing chars — swapped for Unicode box-drawing glyphs
-            // and colored by column so each lane reads as a distinct swim lane.
-            for (i, ch) in row.prefix.chars().enumerate() {
-                if ch == ' ' {
-                    spans.push(Span::raw(" "));
-                    continue;
-                }
-                let glyph = beautify_glyph(ch, row.is_merge);
-                let mut style = Style::default().fg(glyph_color(i, ch));
-                // Commit nodes are the visual anchors — bold makes them pop
-                // above the lane rails without changing width.
-                if ch == '*' {
-                    style = style.add_modifier(Modifier::BOLD);
-                }
-                spans.push(Span::styled(glyph.to_string(), style));
-            }
+            let mut spans = graph_prefix_spans(row);
 
             // Connector-only rows (no commit on them) stop here.
             if row.sha.is_none() {
@@ -1934,6 +2075,118 @@ fn ref_chip(r: &str) -> Span<'static> {
         )
     };
     Span::styled(label, style)
+}
+
+// Full-screen detailed commit graph for one repo, opened from the
+// repo-action menu ("Inspect git"). Same lanes as the compact graph, but
+// each commit also shows its short sha, diff stats, absolute date, and
+// author.
+fn draw_git_inspect(f: &mut Frame, app: &App, area: Rect, name: &str) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::reset());
+
+    let (title, lines) = match app.graph_cache.get(name) {
+        Some(rows) => {
+            let commits = rows.iter().filter(|r| r.sha.is_some()).count();
+            let title = format!(
+                " Inspect — {name} · {commits} commit{}  (↑/↓ scroll · Esc back) ",
+                if commits == 1 { "" } else { "s" },
+            );
+            (title, render_inspect_graph(rows, app.stats_cache.get(name)))
+        }
+        None => (
+            format!(" Inspect — {name}  (Esc back) "),
+            vec![Line::from(Span::styled(
+                "loading …",
+                Style::default().fg(Color::DarkGray),
+            ))],
+        ),
+    };
+
+    // Cache the rendered size so Up/Down can clamp its scroll on the next tick.
+    app.inspect_content_lines.set(lines.len() as u16);
+    app.inspect_inner_height.set(area.height.saturating_sub(2));
+
+    let para = Paragraph::new(lines)
+        .style(Style::reset())
+        .scroll((app.inspect_scroll, 0))
+        .block(block.title(title));
+    f.render_widget(para, area);
+}
+
+fn render_inspect_graph(
+    rows: &[GraphRow],
+    stats: Option<&HashMap<String, git::CommitStat>>,
+) -> Vec<Line<'static>> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    rows.iter()
+        .map(|row| {
+            let mut spans = graph_prefix_spans(row);
+            let Some(sha) = &row.sha else {
+                return Line::from(spans);
+            };
+
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                sha.chars().take(7).collect::<String>(),
+                Style::default().fg(Color::Rgb(219, 171, 10)),
+            ));
+
+            for r in &row.refs {
+                spans.push(Span::raw(" "));
+                spans.push(ref_chip(r));
+            }
+
+            spans.push(Span::raw(" "));
+            spans.push(Span::raw(row.subject.clone()));
+
+            // Diff stats — absent for merge commits (git prints no shortstat
+            // for them) and while the stats fetch hasn't landed yet.
+            if let Some(st) = stats.and_then(|m| m.get(sha)) {
+                spans.push(Span::styled(
+                    format!("  +{}", st.insertions),
+                    Style::default().fg(Color::Rgb(126, 231, 135)),
+                ));
+                spans.push(Span::styled(
+                    format!(" −{}", st.deletions),
+                    Style::default().fg(Color::Rgb(255, 123, 114)),
+                ));
+                spans.push(Span::styled(
+                    format!(
+                        " · {} file{}",
+                        st.files,
+                        if st.files == 1 { "" } else { "s" },
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
+            let mut meta: Vec<String> = Vec::new();
+            if !row.date.is_empty() {
+                meta.push(row.date.clone());
+            }
+            if let Some(t) = row.timestamp {
+                meta.push(format_age(now.saturating_sub(t)));
+            }
+            if !row.author.is_empty() {
+                meta.push(row.author.clone());
+            }
+            if !meta.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {}", meta.join(" · ")),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
+            Line::from(spans)
+        })
+        .collect()
 }
 
 fn draw_right_pane(f: &mut Frame, app: &App, area: Rect) {

@@ -45,6 +45,9 @@ pub struct GraphRow {
     pub prefix: String,
     pub sha: Option<String>,
     pub timestamp: Option<u64>,
+    // Committer date pre-formatted by git in the local timezone
+    // ("2026-07-11 14:32") — saves us from doing tz math ourselves.
+    pub date: String,
     pub author: String,
     pub subject: String,
     pub refs: Vec<String>,
@@ -552,7 +555,8 @@ pub fn graph(repo_dir: &Path) -> Vec<GraphRow> {
             "--graph",
             "--date-order",
             "--decorate=short",
-            "--format=%x00%H%x1f%ct%x1f%an%x1f%s%x1f%D%x1f%P",
+            "--date=format-local:%Y-%m-%d %H:%M",
+            "--format=%x00%H%x1f%ct%x1f%an%x1f%s%x1f%D%x1f%P%x1f%cd",
             &format!("-n{GRAPH_MAX_ROWS}"),
         ])
         .output()
@@ -572,6 +576,7 @@ fn parse_graph_line(line: &str) -> GraphRow {
             prefix: line.to_string(),
             sha: None,
             timestamp: None,
+            date: String::new(),
             author: String::new(),
             subject: String::new(),
             refs: Vec::new(),
@@ -586,6 +591,7 @@ fn parse_graph_line(line: &str) -> GraphRow {
     let subject = parts.next().unwrap_or("").to_string();
     let refs_raw = parts.next().unwrap_or("");
     let parents_raw = parts.next().unwrap_or("");
+    let date = parts.next().unwrap_or("").to_string();
 
     let refs: Vec<String> = refs_raw
         .split(',')
@@ -598,11 +604,78 @@ fn parse_graph_line(line: &str) -> GraphRow {
         prefix: prefix.to_string(),
         sha: Some(sha),
         timestamp: ts,
+        date,
         author,
         subject,
         refs,
         is_merge,
     }
+}
+
+pub struct CommitStat {
+    pub files: u32,
+    pub insertions: u32,
+    pub deletions: u32,
+}
+
+// Per-commit diff stats for the same window `graph()` covers, keyed by full
+// sha. One `git log --shortstat` call instead of a diff per commit; merge
+// commits produce no shortstat line and simply won't appear in the map.
+// Runs synchronously like graph() — callers should cache it.
+pub fn commit_stats(repo_dir: &Path) -> HashMap<String, CommitStat> {
+    let out = match Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args([
+            "log",
+            "--all",
+            "--date-order",
+            "--shortstat",
+            "--format=%x00%H",
+            &format!("-n{GRAPH_MAX_ROWS}"),
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return HashMap::new(),
+    };
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut stats = HashMap::new();
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        if let Some(sha) = line.strip_prefix('\x00') {
+            current = Some(sha.trim().to_string());
+        } else if let (Some(sha), Some(stat)) = (&current, parse_shortstat(line)) {
+            stats.insert(sha.clone(), stat);
+        }
+    }
+    stats
+}
+
+// Parse " 3 files changed, 40 insertions(+), 2 deletions(-)". Any of the
+// three clauses can be absent; each is a number followed by its keyword.
+fn parse_shortstat(line: &str) -> Option<CommitStat> {
+    if !line.contains("changed") {
+        return None;
+    }
+    let mut stat = CommitStat { files: 0, insertions: 0, deletions: 0 };
+    let mut last_num: u32 = 0;
+    for token in line
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+    {
+        if let Ok(n) = token.parse() {
+            last_num = n;
+        } else if token.starts_with("file") {
+            stat.files = last_num;
+        } else if token.starts_with("insertion") {
+            stat.insertions = last_num;
+        } else if token.starts_with("deletion") {
+            stat.deletions = last_num;
+        }
+    }
+    Some(stat)
 }
 
 fn git_is_dirty(path: &Path) -> bool {

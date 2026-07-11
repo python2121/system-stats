@@ -21,6 +21,7 @@ Points at a single "watch directory" (e.g. `~/Documents/code`) and scans every r
 - A GitHub-style commit heatmap of *your* commits (matched by `git config user.email`), for all repos combined or the selected one
 - Per-repo tree: branches with ahead/behind counts, current-branch marker, uncommitted-changes flag, and fork drift against an `upstream` remote
 - A colored, lane-styled commit graph for the selected repo, plus a recent-commits feed across all repos
+- **Press Enter on a repo** for actions: open a terminal there, start a new Claude session, or **Inspect git** — a full-screen commit graph with per-commit sha, diff stats (+added −removed, files touched), absolute date, and author; Esc goes back
 
 ### Claude
 
