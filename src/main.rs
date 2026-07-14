@@ -8,7 +8,7 @@ mod processes;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -91,12 +91,18 @@ enum RepoActionItem {
     Claude,
     // Full-screen detailed commit graph for the repo.
     Inspect,
+    // Background `git pull --ff-only`; status shows on the repo's row.
+    Pull,
 }
 
-const REPO_ACTION_ITEMS: [RepoActionItem; 3] =
-    [RepoActionItem::Terminal, RepoActionItem::Claude, RepoActionItem::Inspect];
-const REPO_ACTION_LABELS: [&str; 3] =
-    ["Open terminal here", "New Claude session", "Inspect git"];
+const REPO_ACTION_ITEMS: [RepoActionItem; 4] = [
+    RepoActionItem::Terminal,
+    RepoActionItem::Claude,
+    RepoActionItem::Inspect,
+    RepoActionItem::Pull,
+];
+const REPO_ACTION_LABELS: [&str; 4] =
+    ["Open terminal here", "New Claude session", "Inspect git", "Git pull"];
 
 // Small modal shown when the user hits Esc on the tab bar. Owns its own
 // cursor so nav keys can drive it independently of the pane focus underneath.
@@ -241,6 +247,17 @@ impl DirectoryPrompt {
 
 const EVENT_POLL: Duration = Duration::from_millis(250);
 const HEATMAP_WEEKS_MAX: usize = 27;
+// How long a finished pull's ✓/✗ message stays on the repo row.
+const PULL_RESULT_TTL: Duration = Duration::from_secs(8);
+
+// A background `git pull` triggered from the repo action menu. Keyed by
+// repo name (stable across the re-sorts a rescan causes). One at a time:
+// starting another pull replaces this, which drops the old receiver — the
+// orphaned worker just finishes and its send fails harmlessly.
+enum PullState {
+    Running { repo: String, rx: std::sync::mpsc::Receiver<git::PullOutcome> },
+    Done { repo: String, success: bool, message: String, at: Instant },
+}
 
 struct App {
     scanner: Scanner,
@@ -261,6 +278,8 @@ struct App {
     // repo (by name — stable across the re-sorts a rescan can cause).
     // Esc drops back to the normal three-pane layout.
     git_inspect: Option<String>,
+    // In-flight or recently finished `git pull`, surfaced on the repo row.
+    git_pull: Option<PullState>,
     // Scroll offset for the inspect view, clamped against the size cached
     // by the last draw (same pattern as the left graph pane).
     inspect_scroll: u16,
@@ -356,6 +375,7 @@ impl App {
             graph_cache: HashMap::new(),
             stats_cache: HashMap::new(),
             git_inspect: None,
+            git_pull: None,
             inspect_scroll: 0,
             inspect_content_lines: Cell::new(0),
             inspect_inner_height: Cell::new(0),
@@ -506,6 +526,39 @@ impl App {
             // Scroll only resets on selection change (see move_selection / Esc).
             // If the new graph is shorter than the current offset, the next
             // key press clamps via scroll_left_pane.
+        }
+    }
+
+    fn drain_pull_updates(&mut self) {
+        match &self.git_pull {
+            Some(PullState::Running { rx, repo }) => match rx.try_recv() {
+                Ok(outcome) => {
+                    // Rescan right away so a successful pull's new commits
+                    // and cleared behind-counts show up without the wait.
+                    self.scanner.rescan();
+                    self.git_pull = Some(PullState::Done {
+                        repo: outcome.repo,
+                        success: outcome.success,
+                        message: outcome.message,
+                        at: Instant::now(),
+                    });
+                }
+                // Disconnected = the worker died without reporting; don't
+                // leave "pulling…" on screen forever.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.git_pull = Some(PullState::Done {
+                        repo: repo.clone(),
+                        success: false,
+                        message: "pull failed".to_string(),
+                        at: Instant::now(),
+                    });
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            },
+            Some(PullState::Done { at, .. }) if at.elapsed() >= PULL_RESULT_TTL => {
+                self.git_pull = None;
+            }
+            _ => {}
         }
     }
 
@@ -1104,6 +1157,11 @@ impl App {
                             self.git_inspect = Some(name);
                             self.inspect_scroll = 0;
                         }
+                        RepoActionItem::Pull => {
+                            let rx = git::spawn_pull(name.clone(), path);
+                            self.git_pull =
+                                Some(PullState::Running { repo: name, rx });
+                        }
                     }
                 }
                 // Single-level menu — pop it so we return to the Git tab.
@@ -1362,6 +1420,7 @@ fn main() -> std::io::Result<()> {
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     while !app.should_quit {
         app.drain_git_updates();
+        app.drain_pull_updates();
         app.drain_network_updates();
         app.drain_process_updates();
         app.drain_hardware_updates();
@@ -2212,7 +2271,8 @@ fn draw_right_pane(f: &mut Frame, app: &App, area: Rect) {
                 " Git activity — {} repos in {}  (scanned {}s ago){hint}",
                 tree.total_repos, tree.root_display, rounded,
             );
-            let (lines, extents) = render_git_tree(tree, app.selected_repo);
+            let (lines, extents) =
+                render_git_tree(tree, app.selected_repo, app.git_pull.as_ref());
 
             // Auto-scroll to keep the selected repo in view. The Paragraph
             // clips content past the pane's height, so without this a
@@ -2358,6 +2418,7 @@ fn pick_trunk_idx(branches: &[git::BranchInfo]) -> Option<usize> {
 fn render_git_tree(
     tree: &GitTree,
     selected: Option<usize>,
+    pull: Option<&PullState>,
 ) -> (Vec<Line<'static>>, Vec<(u16, u16)>) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2414,6 +2475,28 @@ fn render_git_tree(
                 upstream.clone(),
                 Style::default().fg(Color::Yellow),
             ));
+        }
+        match pull {
+            Some(PullState::Running { repo: r, .. }) if *r == repo.name => {
+                header_spans.push(Span::styled(
+                    "   ⇣ pulling…".to_string(),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+            Some(PullState::Done { repo: r, success, message, .. })
+                if *r == repo.name =>
+            {
+                let (mark, color) = if *success {
+                    ("✓", Color::Green)
+                } else {
+                    ("✗", Color::Red)
+                };
+                header_spans.push(Span::styled(
+                    format!("   {mark} {}", truncate(message, 60)),
+                    Style::default().fg(color),
+                ));
+            }
+            _ => {}
         }
         lines.push(Line::from(header_spans));
 

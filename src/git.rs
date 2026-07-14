@@ -110,6 +110,12 @@ impl Scanner {
         // thread is exiting; either way the settings write already happened.
         let _ = self.wake_tx.send(());
     }
+
+    // Kick off a rescan of the current root right now — used after a pull
+    // completes so ahead/behind counts update without waiting for the tick.
+    pub fn rescan(&self) {
+        let _ = self.wake_tx.send(());
+    }
 }
 
 pub fn spawn_scanner(initial_root: PathBuf) -> Scanner {
@@ -251,6 +257,83 @@ fn fetch_repos(root: &Path) {
             .args(["fetch", "--all", "--quiet"])
             .output();
     }
+}
+
+pub struct PullOutcome {
+    pub repo: String,
+    pub success: bool,
+    pub message: String,
+}
+
+// Run `git pull` for one repo on a background thread so a slow network
+// never freezes the UI; the caller polls the returned channel each tick.
+// `--ff-only` because there's no terminal to resolve a merge or conflicts
+// in — if the branch has diverged the pull fails with git's message and
+// the repo is left untouched. Same no-prompt env vars as fetch_repos.
+pub fn spawn_pull(repo: String, path: PathBuf) -> Receiver<PullOutcome> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes -oConnectTimeout=5")
+            .args(["pull", "--ff-only"])
+            .output();
+        let outcome = match out {
+            Ok(o) if o.status.success() => PullOutcome {
+                repo,
+                success: true,
+                message: pull_success_message(&String::from_utf8_lossy(&o.stdout)),
+            },
+            Ok(o) => PullOutcome {
+                repo,
+                success: false,
+                message: pull_error_message(&String::from_utf8_lossy(&o.stderr)),
+            },
+            Err(e) => PullOutcome {
+                repo,
+                success: false,
+                message: format!("couldn't run git: {e}"),
+            },
+        };
+        let _ = tx.send(outcome);
+    });
+    rx
+}
+
+fn pull_success_message(stdout: &str) -> String {
+    if stdout.contains("Already up to date") {
+        return "already up to date".to_string();
+    }
+    // A fast-forward pull ends with a shortstat line like
+    // " 3 files changed, 40 insertions(+), 2 deletions(-)".
+    stdout
+        .lines()
+        .find(|l| l.contains("changed"))
+        .map(|l| format!("pulled — {}", l.trim()))
+        .unwrap_or_else(|| "pulled latest".to_string())
+}
+
+fn pull_error_message(stderr: &str) -> String {
+    // git puts the useful line behind a "fatal:"/"error:" prefix; hint
+    // lines and progress noise come before/after it.
+    stderr
+        .lines()
+        .find_map(|l| {
+            let l = l.trim();
+            l.strip_prefix("fatal: ")
+                .or_else(|| l.strip_prefix("error: "))
+        })
+        .map(|s| s.to_string())
+        .or_else(|| {
+            stderr
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "pull failed".to_string())
 }
 
 fn user_email() -> Option<String> {
