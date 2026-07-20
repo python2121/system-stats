@@ -546,7 +546,7 @@ fn git_branches(path: &Path) -> Vec<BranchInfo> {
         .args([
             "for-each-ref",
             "--sort=-committerdate",
-            "--format=%(refname:short)|%(committerdate:unix)|%(upstream:track)|%(subject)",
+            "--format=%(refname)|%(committerdate:unix)|%(upstream:track)|%(subject)",
             "refs/heads/",
             "refs/remotes/origin/",
         ])
@@ -558,44 +558,66 @@ fn git_branches(path: &Path) -> Vec<BranchInfo> {
 
     let text = String::from_utf8_lossy(&out.stdout);
     let mut locals: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut all: Vec<BranchInfo> = Vec::new();
+    // Each entry tagged with whether the ref is a local branch, so the
+    // ordering pass below can float locals without re-guessing from the name
+    // (a local branch can legally be named "origin/whatever").
+    let mut all: Vec<(bool, BranchInfo)> = Vec::new();
     for line in text.lines() {
         // splitn(4) so a '|' inside the subject doesn't break parsing.
         let mut parts = line.splitn(4, '|');
-        let Some(name) = parts.next() else { continue };
+        let Some(refname) = parts.next() else { continue };
         // `origin/HEAD` is a symbolic ref pointing at (typically) `origin/main`.
-        // Including it would duplicate the branch it points at.
-        if name == "origin/HEAD" {
+        // Including it would duplicate the branch it points at. Match on the
+        // full refname — its %(refname:short) is just "origin", not "origin/HEAD".
+        if refname == "refs/remotes/origin/HEAD" {
             continue;
         }
-        let name = name.to_string();
+        let (name, is_local) = if let Some(local) = refname.strip_prefix("refs/heads/") {
+            (local.to_string(), true)
+        } else if let Some(remote) = refname.strip_prefix("refs/remotes/") {
+            (remote.to_string(), false)
+        } else {
+            continue;
+        };
         let Some(ts_str) = parts.next() else { continue };
         let ts: Option<u64> = ts_str.parse().ok();
         let track = parts.next().unwrap_or("");
         let subject = parts.next().unwrap_or("").to_string();
         let (ahead, behind) = parse_track(track);
-        if !name.starts_with("origin/") {
+        if is_local {
             locals.insert(name.clone());
         }
-        all.push(BranchInfo {
-            name,
-            is_current: false,
-            ahead,
-            behind,
-            last_commit: ts,
-            last_message: subject,
-        });
+        all.push((
+            is_local,
+            BranchInfo {
+                name,
+                is_current: false,
+                ahead,
+                behind,
+                last_commit: ts,
+                last_message: subject,
+            },
+        ));
     }
 
     // Drop remote branches that already have a local counterpart with the
     // same short name — the local BranchInfo already carries the ahead/behind
-    // tracking info, so keeping the remote copy would be redundant. Retain
-    // preserves the sorted-by-committerdate order from for-each-ref.
-    all.retain(|b| match b.name.strip_prefix("origin/") {
-        Some(short) => !locals.contains(short),
-        None => true,
+    // tracking info, so keeping the remote copy would be redundant.
+    all.retain(|(is_local, b)| {
+        *is_local
+            || match b.name.strip_prefix("origin/") {
+                Some(short) => !locals.contains(short),
+                None => true,
+            }
     });
-    all
+
+    // Float local branches above remote-only ones (stable sort keeps the
+    // committerdate order within each group). Only locals carry ahead/behind
+    // tracking info, so this keeps a busy upstream's remote branches from
+    // pushing e.g. a behind-by-many local main past the per-repo truncation
+    // cap in summarize_repo.
+    all.sort_by_key(|(is_local, _)| !*is_local);
+    all.into_iter().map(|(_, b)| b).collect()
 }
 
 // git's %(upstream:track) values: "", "[gone]", "[ahead N]", "[behind N]",
