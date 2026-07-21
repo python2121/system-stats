@@ -2648,8 +2648,13 @@ fn app_accent(name: &str) -> Color {
 
 fn draw_network(f: &mut Frame, app: &App, area: Rect) {
     if app.net_monitor.is_none() {
-        let msg = "network monitor unavailable — `nettop` failed to spawn.\n\
-                   Try running `nettop -x -L 1` manually to confirm access.";
+        let msg = if cfg!(target_os = "macos") {
+            "network monitor unavailable — `nettop` failed to spawn.\n\
+             Try running `nettop -x -L 1` manually to confirm access."
+        } else {
+            "per-app network monitoring isn't available on this platform —\n\
+             it rides on macOS' `nettop`, which has no unprivileged equivalent here."
+        };
         let para = Paragraph::new(msg)
             .style(Style::default().fg(Color::Red))
             .block(Block::default().borders(Borders::ALL).title(" Network "));

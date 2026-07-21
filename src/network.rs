@@ -91,6 +91,13 @@ fn run_nettop() -> Option<String> {
 // sample, so the app/connection inventory shows up immediately (with
 // zero rates) rather than after the first interval.
 pub fn spawn_monitor() -> Option<Monitor> {
+    // Per-app attribution rides on `nettop`, which is Darwin-only — no
+    // unprivileged equivalent exists elsewhere. The probe below would
+    // fail anyway on other platforms; skip it so the tab shows its
+    // unavailable state immediately instead of after a spawn attempt.
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
     let first = run_nettop()?;
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {

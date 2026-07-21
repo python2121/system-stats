@@ -362,6 +362,7 @@ fn claude_dir() -> Option<PathBuf> {
 // string must already be shell-ready (quoted as needed) — it's dropped in
 // verbatim. Fire-and-forget: the launcher process is spawned detached and
 // failures are silent — the new window (or its absence) is its own feedback.
+#[cfg(target_os = "macos")]
 pub fn open_in_terminal(
     terminal: config::TerminalApp,
     dir: &Path,
@@ -445,6 +446,18 @@ pub fn open_in_terminal(
     }
 }
 
+// Terminal-window scripting is AppleScript-only for now, so on other
+// platforms the "open terminal here" / "new session" actions are silent
+// no-ops. A Linux launcher (gnome-terminal/kitty/alacritty spawns) would
+// slot in here without touching any caller.
+#[cfg(not(target_os = "macos"))]
+pub fn open_in_terminal(
+    _terminal: config::TerminalApp,
+    _dir: &Path,
+    _command: Option<&str>,
+) {
+}
+
 // Open a new terminal window, cd into the project, and re-attach to a
 // session with `claude --resume`. Thin wrapper over open_in_terminal.
 pub fn resume_in_terminal(
@@ -462,6 +475,7 @@ fn shell_quote(s: &str) -> String {
 }
 
 // Escape for embedding inside an AppleScript double-quoted string.
+#[cfg(target_os = "macos")]
 fn applescript_escape(s: &str) -> String {
     s.replace('\\', r"\\").replace('"', "\\\"")
 }
@@ -798,9 +812,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shell_and_applescript_quoting() {
+    fn shell_quoting() {
         assert_eq!(shell_quote("/Users/a/My Code"), "'/Users/a/My Code'");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn applescript_quoting() {
         assert_eq!(
             applescript_escape(r#"cd '/a/b' && claude --resume 'x"y'"#),
             r#"cd '/a/b' && claude --resume 'x\"y'"#,
