@@ -22,7 +22,7 @@ use ratatui::{
 use claude::{ClaudeTree, ProjectSessions};
 use config::Config;
 use git::{GitTree, GraphRow, RecentCommit, Scanner, spawn_scanner};
-use hardware::{BatterySnapshot, HardwareState};
+use hardware::{BatterySnapshot, HardwareState, SystemPowerSnapshot};
 use network::{AppStat, Monitor, NetworkState};
 use processes::{ProcInfo, ProcessState};
 
@@ -43,10 +43,22 @@ enum Tab {
     Claude,
 }
 
+#[cfg(target_os = "macos")]
 const TABS: [Tab; 5] =
     [Tab::GitStatus, Tab::Claude, Tab::Processes, Tab::Network, Tab::DiskPower];
+#[cfg(target_os = "macos")]
 const TAB_LABELS: [&str; 5] =
     ["Git Status", "Claude", "Processes", "Network", "Disk / Power"];
+// Per-app network attribution rides on nettop, which is Darwin-only, so
+// off macOS the Network tab would be a permanent "unavailable" screen —
+// drop it from the strip instead. Tab::Network and its draw/key code
+// still compile everywhere; the variant just can't be reached.
+#[cfg(not(target_os = "macos"))]
+const TABS: [Tab; 4] =
+    [Tab::GitStatus, Tab::Claude, Tab::Processes, Tab::DiskPower];
+#[cfg(not(target_os = "macos"))]
+const TAB_LABELS: [&str; 4] =
+    ["Git Status", "Claude", "Processes", "Disk / Power"];
 
 impl Tab {
     fn index(self) -> usize {
@@ -3914,40 +3926,173 @@ fn draw_volumes(f: &mut Frame, state: &HardwareState, area: Rect) {
 }
 
 fn draw_power(f: &mut Frame, state: &HardwareState, area: Rect) {
-    let Some(bat) = &state.battery else {
-        // Desktop Mac (or first sample pending): no battery telemetry.
-        let msg = if state.last_sample_at.is_none() {
-            "waiting for first sample …"
-        } else {
-            "no battery detected — power telemetry needs a portable Mac."
-        };
-        let para = Paragraph::new(Line::from(Span::styled(
-            format!("  {msg}"),
-            Style::default().fg(Color::DarkGray),
-        )))
-        .style(Style::reset())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .style(Style::reset())
-                .title(" Power "),
-        );
-        f.render_widget(para, area);
-        return;
-    };
-
-    // Battery-flow chart on the left, detail panel on the right. The
-    // panel is fixed-width prose; the chart soaks up the rest.
+    // Chart on the left, detail panel on the right. The panel is
+    // fixed-width prose; the chart soaks up the rest.
     let panel_w: u16 = 52;
     let halves = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Length(panel_w)])
         .split(area);
 
-    draw_battery_flow(f, state, bat, halves[0]);
-    draw_battery_panel(f, bat, halves[1]);
+    if let Some(bat) = &state.battery {
+        draw_battery_flow(f, state, bat, halves[0]);
+        draw_battery_panel(f, bat, halves[1]);
+        return;
+    }
+    // No battery, but the machine reports package power (Linux hwmon):
+    // same layout with the SoC draw in place of the battery flow.
+    if let Some(sys) = &state.system {
+        draw_package_flow(f, state, sys, halves[0]);
+        draw_system_panel(f, sys, halves[1]);
+        return;
+    }
+
+    // Desktop Mac, sensor-less Linux box, or first sample pending.
+    let msg = if state.last_sample_at.is_none() {
+        "waiting for first sample …"
+    } else if cfg!(target_os = "macos") {
+        "no battery detected — power telemetry needs a portable Mac."
+    } else {
+        "no power telemetry — no battery or supported power sensor found."
+    };
+    let para = Paragraph::new(Line::from(Span::styled(
+        format!("  {msg}"),
+        Style::default().fg(Color::DarkGray),
+    )))
+    .style(Style::reset())
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .style(Style::reset())
+            .title(" Power "),
+    );
+    f.render_widget(para, area);
+}
+
+// Package-draw chart: the battery-flow renderer pointed at the SoC's
+// wattage history (stored negative, so it draws in the drain color —
+// power leaving the wall).
+fn draw_package_flow(
+    f: &mut Frame,
+    state: &HardwareState,
+    sys: &SystemPowerSnapshot,
+    area: Rect,
+) {
+    let peak = state.history_package.iter().copied().min().unwrap_or(0).min(0).unsigned_abs();
+    let scale = nice_ceil(peak.max(10));
+
+    let mut title_spans = vec![Span::styled(
+        format!(" package power · {:.1} W ", state.ema_package_w),
+        Style::default().fg(CPU_RAMP[2]).add_modifier(Modifier::BOLD),
+    )];
+    let cap_part = sys
+        .cap_watts
+        .map(|c| format!(" · cap {c:.0} W"))
+        .unwrap_or_default();
+    title_spans.push(Span::styled(
+        format!("peak {:.1} W{cap_part} ", peak as f64 / 10.0),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .style(Style::reset())
+        .title(Line::from(title_spans));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Same gutter/axis treatment as the battery-flow chart.
+    const GUTTER_W: u16 = 7;
+    let rows = inner.height as usize;
+    let chart_w = if inner.width > GUTTER_W + 8 {
+        (inner.width - GUTTER_W) as usize
+    } else {
+        inner.width as usize
+    };
+    let mut lines = render_flow_line(&state.history_package, chart_w, rows, scale);
+    if chart_w < inner.width as usize {
+        let ticks = axis_ticks(rows, scale);
+        for (r, line) in lines.iter_mut().enumerate() {
+            let gutter = match ticks.iter().find(|(row, _)| *row == r) {
+                Some((_, watts)) => format!("{:>5} ┤", format_watts_label(*watts)),
+                None => "      │".to_string(),
+            };
+            line.spans
+                .insert(0, Span::styled(gutter, Style::default().fg(Color::DarkGray)));
+        }
+    }
+    f.render_widget(Paragraph::new(lines).style(Style::reset()), inner);
+}
+
+// What a battery-less machine can still tell us: SoC draw against its
+// power cap, die temperatures, the GPU rail, and the fan.
+fn draw_system_panel(f: &mut Frame, sys: &SystemPowerSnapshot, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .style(Style::reset())
+        .title(" System ");
+
+    let label = |s: &str| Span::styled(format!("  {s:<9}"), Style::default().fg(Color::DarkGray));
+    let value = |s: String| Span::styled(s, Style::default().fg(Color::Gray));
+    let temp_value = |c: f64| {
+        let color = if c >= 90.0 {
+            Color::Rgb(248, 81, 73)
+        } else if c >= 75.0 {
+            CPU_RAMP[1]
+        } else {
+            Color::Gray
+        };
+        Span::styled(format!("{c:.0} °C"), Style::default().fg(color))
+    };
+
+    let mut lines: Vec<Line<'static>> = vec![Line::from("")];
+
+    // Draw vs cap, with the battery panel's gauge when a cap is known.
+    let mut power_spans = vec![label("power")];
+    if let Some(cap) = sys.cap_watts.filter(|c| *c > 0.0) {
+        let frac = (sys.package_watts / cap).clamp(0.0, 1.0);
+        let color = if frac > 0.85 { CPU_RAMP[1] } else { DOWN_RAMP[1] };
+        let filled = ((frac * PWR_GAUGE_W as f64).round() as usize).min(PWR_GAUGE_W);
+        power_spans.push(Span::styled("▰".repeat(filled), Style::default().fg(color)));
+        power_spans.push(Span::styled(
+            "▱".repeat(PWR_GAUGE_W - filled),
+            Style::default().fg(Color::Rgb(60, 66, 74)),
+        ));
+        power_spans.push(value(format!(" {:.1} of {cap:.0} W", sys.package_watts)));
+    } else {
+        power_spans.push(value(format!("{:.1} W", sys.package_watts)));
+    }
+    lines.push(Line::from(power_spans));
+
+    if let Some(c) = sys.cpu_temp_c {
+        lines.push(Line::from(vec![label("cpu"), temp_value(c)]));
+    }
+    if let Some(c) = sys.gpu_temp_c {
+        lines.push(Line::from(vec![label("gpu"), temp_value(c)]));
+    }
+    if let Some(mv) = sys.gpu_mv {
+        lines.push(Line::from(vec![
+            label("gpu rail"),
+            value(format!("{:.3} V", mv as f64 / 1000.0)),
+        ]));
+    }
+    if let Some(rpm) = sys.fan_rpm {
+        lines.push(Line::from(vec![label("fan"), value(format!("{rpm} rpm"))]));
+    }
+
+    f.render_widget(
+        Paragraph::new(lines).style(Style::reset()).block(block),
+        area,
+    );
 }
 
 // Signed battery-flow chart, drawn as a braille line: amber while

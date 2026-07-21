@@ -56,6 +56,9 @@ pub struct HwSample {
     pub interval: Duration,
     // None when the machine has no battery (desktop) or the read failed.
     pub battery: Option<BatterySnapshot>,
+    // Whole-package power/thermal telemetry for machines that expose it
+    // (Linux hwmon). Fills the power panel on battery-less hardware.
+    pub system: Option<SystemPowerSnapshot>,
     // Cumulative counters summed over every storage device. None if the
     // read failed.
     pub disk: Option<DiskCounters>,
@@ -108,6 +111,24 @@ impl BatterySnapshot {
             0.0
         }
     }
+}
+
+// Power draw and thermals for the machine as a whole rather than its
+// battery — what a desktop (or a handheld's SoC) can report. On Linux
+// this comes from hwmon: the amdgpu driver's PPT reading covers the
+// whole APU package on AMD SoCs. Everything but the wattage is
+// best-effort and optional.
+#[derive(Clone, Default)]
+pub struct SystemPowerSnapshot {
+    // Package power draw in watts (amdgpu "PPT" — CPU+GPU on an APU).
+    pub package_watts: f64,
+    // The enforced power limit, when the driver exposes one.
+    pub cap_watts: Option<f64>,
+    pub cpu_temp_c: Option<f64>,
+    pub gpu_temp_c: Option<f64>,
+    pub fan_rpm: Option<i64>,
+    // GPU core rail voltage, millivolts.
+    pub gpu_mv: Option<i64>,
 }
 
 #[derive(Clone, Default)]
@@ -181,6 +202,20 @@ impl Monitor {
 // How often the slow sweep re-checks the partition table.
 pub const UNMOUNTED_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 
+// Only the Linux backend has a system-power source so far; routing the
+// call through this cfg'd shim (rather than a stub in every backend)
+// keeps the macOS backend untouched.
+fn sample_system_power() -> Option<SystemPowerSnapshot> {
+    #[cfg(target_os = "linux")]
+    {
+        platform::system_power()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 pub fn spawn_monitor() -> Monitor {
     let (tx, rx) = mpsc::channel();
     let slow_tx = tx.clone();
@@ -189,6 +224,7 @@ pub fn spawn_monitor() -> Monitor {
             let sample = HwSample {
                 interval: SAMPLE_INTERVAL,
                 battery: platform::battery(),
+                system: sample_system_power(),
                 disk: platform::disk_counters(),
                 volumes: platform::read_volumes(),
                 unmounted: None,
@@ -209,6 +245,7 @@ pub fn spawn_monitor() -> Monitor {
                 let sample = HwSample {
                     interval: SAMPLE_INTERVAL,
                     battery: None,
+                    system: None,
                     disk: None,
                     volumes: Vec::new(),
                     unmounted: Some(unmounted),
@@ -231,6 +268,12 @@ pub struct HardwareState {
     pub ema_watts: f64,
     // Signed battery-flow history in deciwatts, newest at back.
     pub history_watts: VecDeque<i32>,
+    pub system: Option<SystemPowerSnapshot>,
+    // Smoothed package draw, watts.
+    pub ema_package_w: f64,
+    // Package-draw history in deciwatts, stored negative so the shared
+    // flow chart renders it in the "draining" color.
+    pub history_package: VecDeque<i32>,
     pub ema_read_bps: f64,
     pub ema_write_bps: f64,
     pub history_read: VecDeque<u32>,
@@ -258,6 +301,9 @@ impl HardwareState {
             battery: None,
             ema_watts: 0.0,
             history_watts: VecDeque::with_capacity(TOTAL_HISTORY_LEN),
+            system: None,
+            ema_package_w: 0.0,
+            history_package: VecDeque::with_capacity(TOTAL_HISTORY_LEN),
             ema_read_bps: 0.0,
             ema_write_bps: 0.0,
             history_read: VecDeque::with_capacity(TOTAL_HISTORY_LEN),
@@ -283,6 +329,14 @@ impl HardwareState {
             let deci = (bat.watts * 10.0).round() as i32;
             push_history_signed(&mut self.history_watts, deci, TOTAL_HISTORY_LEN);
             self.battery = sample.battery;
+        }
+
+        if let Some(sys) = &sample.system {
+            self.ema_package_w =
+                self.ema_package_w * (1.0 - alpha) + sys.package_watts * alpha;
+            let deci = -(sys.package_watts * 10.0).round() as i32;
+            push_history_signed(&mut self.history_package, deci, TOTAL_HISTORY_LEN);
+            self.system = sample.system.clone();
         }
 
         if let Some(cur) = sample.disk {
@@ -367,6 +421,7 @@ mod tests {
         let s = |read_bytes, read_ops, read_time_ns| HwSample {
             interval: SAMPLE_INTERVAL,
             battery: None,
+            system: None,
             disk: Some(DiskCounters {
                 read_bytes,
                 write_bytes: 0,

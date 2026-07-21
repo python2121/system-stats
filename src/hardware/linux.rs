@@ -16,7 +16,7 @@ use std::process::Command;
 
 use sysinfo::Disks;
 
-use super::{BatterySnapshot, DiskCounters, UnmountedVolume, VolumeInfo};
+use super::{BatterySnapshot, DiskCounters, SystemPowerSnapshot, UnmountedVolume, VolumeInfo};
 
 pub fn battery() -> Option<BatterySnapshot> {
     let dir = find_supply("Battery")?;
@@ -41,6 +41,75 @@ pub fn scan_unmounted() -> Option<Vec<UnmountedVolume>> {
         .ok()
         .filter(|o| o.status.success())?;
     Some(parse_lsblk(&String::from_utf8_lossy(&out.stdout)))
+}
+
+// Whole-package power/thermal telemetry from /sys/class/hwmon. The
+// wattage comes from the amdgpu driver's PPT sensor, which on an AMD
+// APU (Steam Deck, Steam Machine, most handhelds) tracks the whole
+// SoC package, not just the GPU. RAPL would cover Intel too but its
+// energy counters went root-only after the PLATYPUS side-channel, so
+// machines without an amdgpu report None and the panel stays dark.
+pub fn system_power() -> Option<SystemPowerSnapshot> {
+    let mut snap = SystemPowerSnapshot::default();
+    let mut have_watts = false;
+    for entry in fs::read_dir("/sys/class/hwmon").ok()?.flatten() {
+        let dir = entry.path();
+        let Some(name) = read_trimmed(dir.join("name")) else { continue };
+        merge_hwmon(&mut snap, &mut have_watts, &name, &|f| {
+            read_trimmed(dir.join(f))
+        });
+    }
+    have_watts.then_some(snap)
+}
+
+// Fold one hwmon device into the snapshot. Factored over `read` (like
+// battery_from) so tests can feed it maps instead of a /sys tree.
+// First writer wins for every field: with two GPUs the first amdgpu is
+// arbitrary but stable within a boot, and any device's spinning fan
+// beats a later one's.
+fn merge_hwmon(
+    snap: &mut SystemPowerSnapshot,
+    have_watts: &mut bool,
+    name: &str,
+    read: &dyn Fn(&str) -> Option<String>,
+) {
+    let num = |file: &str| read(file).and_then(|v| v.parse::<i64>().ok());
+    match name {
+        "amdgpu" => {
+            // power1_average on most kernels; newer ones expose
+            // power1_input instead. Both are µW.
+            if !*have_watts {
+                if let Some(uw) = num("power1_average").or_else(|| num("power1_input")) {
+                    snap.package_watts = uw as f64 / 1e6;
+                    *have_watts = true;
+                    snap.cap_watts =
+                        num("power1_cap").map(|uw| uw as f64 / 1e6).filter(|w| *w > 0.0);
+                }
+            }
+            if snap.gpu_temp_c.is_none() {
+                // temp1 is the edge sensor on amdgpu.
+                snap.gpu_temp_c = num("temp1_input").map(|t| t as f64 / 1000.0);
+            }
+            if snap.gpu_mv.is_none() {
+                // in0 is the vddgfx rail, already in millivolts.
+                snap.gpu_mv = num("in0_input").filter(|v| *v > 0);
+            }
+        }
+        // CPU die temperature: k10temp's temp1 is Tctl on AMD;
+        // coretemp's is the package sensor on Intel.
+        "k10temp" | "coretemp" | "zenpower" => {
+            if snap.cpu_temp_c.is_none() {
+                snap.cpu_temp_c = num("temp1_input").map(|t| t as f64 / 1000.0);
+            }
+        }
+        _ => {}
+    }
+    // Any device's fan counts (the Deck/Steam Machine fan lives under
+    // steamdeck_hwmon, not amdgpu), but only one that's actually
+    // reporting — amdgpu often has a fan1_input stuck at 0.
+    if snap.fan_rpm.is_none() {
+        snap.fan_rpm = num("fan1_input").filter(|r| *r > 0);
+    }
 }
 
 // First /sys/class/power_supply entry whose `type` matches — "Battery"
@@ -357,6 +426,56 @@ mod tests {
         assert!(battery(&[("status", "Unknown")], None).is_none());
     }
 
+    fn merge(snap: &mut SystemPowerSnapshot, have: &mut bool, name: &str, files: &[(&str, &str)]) {
+        let map: HashMap<&str, &str> = files.iter().copied().collect();
+        merge_hwmon(snap, have, name, &|f| map.get(f).map(|v| v.to_string()));
+    }
+
+    #[test]
+    fn hwmon_devices_fold_into_one_snapshot() {
+        // Steam Machine-shaped fixture: fan on the platform device,
+        // power/temps on amdgpu (with a dead fan tach), CPU on k10temp.
+        let mut snap = SystemPowerSnapshot::default();
+        let mut have = false;
+        merge(&mut snap, &mut have, "steamdeck_hwmon", &[("fan1_input", "481")]);
+        merge(
+            &mut snap,
+            &mut have,
+            "amdgpu",
+            &[
+                ("power1_average", "8000000"),
+                ("power1_cap", "110000000"),
+                ("temp1_input", "42000"),
+                ("in0_input", "736"),
+                ("fan1_input", "0"),
+            ],
+        );
+        merge(&mut snap, &mut have, "k10temp", &[("temp1_input", "40625")]);
+        assert!(have);
+        assert!((snap.package_watts - 8.0).abs() < 0.001);
+        assert_eq!(snap.cap_watts, Some(110.0));
+        assert_eq!(snap.gpu_temp_c, Some(42.0));
+        assert_eq!(snap.cpu_temp_c, Some(40.625));
+        assert_eq!(snap.gpu_mv, Some(736));
+        // The platform fan won and amdgpu's stuck-at-zero tach didn't
+        // overwrite it.
+        assert_eq!(snap.fan_rpm, Some(481));
+    }
+
+    #[test]
+    fn no_power_sensor_means_no_snapshot() {
+        // Temps alone don't make a snapshot — the chart needs watts.
+        let mut snap = SystemPowerSnapshot::default();
+        let mut have = false;
+        merge(&mut snap, &mut have, "coretemp", &[("temp1_input", "50000")]);
+        assert!(!have);
+        // power1_input is the fallback spelling for the wattage.
+        merge(&mut snap, &mut have, "amdgpu", &[("power1_input", "15500000")]);
+        assert!(have);
+        assert!((snap.package_watts - 15.5).abs() < 0.001);
+        assert_eq!(snap.cap_watts, None);
+    }
+
     #[test]
     fn whole_disk_detection() {
         for whole in ["sda", "vdb", "xvda", "hda", "nvme0n1", "mmcblk0", "nvme10n2"] {
@@ -414,6 +533,6 @@ sda2 part   1048576
     fn unescape_handles_hex_and_literals() {
         assert_eq!(unescape("Windows\\x20Data"), "Windows Data");
         assert_eq!(unescape("plain"), "plain");
-        assert_eq!(unescape("trailing\\x"), "\\x");
+        assert_eq!(unescape("trailing\\x"), "trailing\\x");
     }
 }
