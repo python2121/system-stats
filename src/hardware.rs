@@ -122,6 +122,10 @@ impl BatterySnapshot {
 pub struct SystemPowerSnapshot {
     // Package power draw in watts (amdgpu "PPT" — CPU+GPU on an APU).
     pub package_watts: f64,
+    // Whether package_watts covers the CPU too: true on an APU (Steam
+    // Deck), false when the sensor is a discrete GPU's (Steam Machine).
+    // Drives the chart label — "package power" vs "gpu power".
+    pub covers_cpu: bool,
     // The enforced power limit, when the driver exposes one.
     pub cap_watts: Option<f64>,
     pub cpu_temp_c: Option<f64>,

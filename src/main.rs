@@ -3983,8 +3983,11 @@ fn draw_package_flow(
     let peak = state.history_package.iter().copied().min().unwrap_or(0).min(0).unsigned_abs();
     let scale = nice_ceil(peak.max(10));
 
+    // "package" only when the sensor really covers the CPU (APU);
+    // on a discrete card the honest name is "gpu power".
+    let what = if sys.covers_cpu { "package power" } else { "gpu power" };
     let mut title_spans = vec![Span::styled(
-        format!(" package power · {:.1} W ", state.ema_package_w),
+        format!(" {what} · {:.1} W ", state.ema_package_w),
         Style::default().fg(CPU_RAMP[2]).add_modifier(Modifier::BOLD),
     )];
     let cap_part = sys

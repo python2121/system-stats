@@ -44,11 +44,12 @@ pub fn scan_unmounted() -> Option<Vec<UnmountedVolume>> {
 }
 
 // Whole-package power/thermal telemetry from /sys/class/hwmon. The
-// wattage comes from the amdgpu driver's PPT sensor, which on an AMD
-// APU (Steam Deck, Steam Machine, most handhelds) tracks the whole
-// SoC package, not just the GPU. RAPL would cover Intel too but its
-// energy counters went root-only after the PLATYPUS side-channel, so
-// machines without an amdgpu report None and the panel stays dark.
+// wattage comes from the amdgpu driver's PPT sensor: on an AMD APU
+// (Steam Deck, most handhelds) that tracks the whole SoC package, on a
+// discrete card (Steam Machine) just the GPU — covers_cpu records
+// which. RAPL would add the CPU on any machine but its energy counters
+// went root-only after the PLATYPUS side-channel, so machines without
+// an amdgpu report None and the panel stays dark.
 pub fn system_power() -> Option<SystemPowerSnapshot> {
     let mut snap = SystemPowerSnapshot::default();
     let mut have_watts = false;
@@ -58,8 +59,22 @@ pub fn system_power() -> Option<SystemPowerSnapshot> {
         merge_hwmon(&mut snap, &mut have_watts, &name, &|f| {
             read_trimmed(dir.join(f))
         });
+        // The hwmon's device symlink leads to the PCI device, whose
+        // gpu_metrics blob tells APU from discrete card.
+        if name == "amdgpu" && !snap.covers_cpu {
+            if let Ok(blob) = fs::read(dir.join("device/gpu_metrics")) {
+                snap.covers_cpu = gpu_metrics_is_apu(&blob);
+            }
+        }
     }
     have_watts.then_some(snap)
+}
+
+// gpu_metrics header: u16 size, u8 format_revision, u8 content_revision.
+// Format 1 is the discrete-GPU table; 2 and 3 are the APU tables, whose
+// socket power includes the CPU cores.
+fn gpu_metrics_is_apu(blob: &[u8]) -> bool {
+    blob.get(2).is_some_and(|rev| *rev >= 2)
 }
 
 // Fold one hwmon device into the snapshot. Factored over `read` (like
@@ -460,6 +475,17 @@ mod tests {
         // The platform fan won and amdgpu's stuck-at-zero tach didn't
         // overwrite it.
         assert_eq!(snap.fan_rpm, Some(481));
+    }
+
+    #[test]
+    fn gpu_metrics_header_tells_apu_from_discrete() {
+        // v1.3 header from a real Navi 33 (discrete).
+        assert!(!gpu_metrics_is_apu(&[0x78, 0x00, 0x01, 0x03]));
+        // v2.x / v3.x are the APU tables.
+        assert!(gpu_metrics_is_apu(&[0x88, 0x00, 0x02, 0x02]));
+        assert!(gpu_metrics_is_apu(&[0x40, 0x00, 0x03, 0x00]));
+        // Unreadable/truncated blob: keep the conservative GPU-only label.
+        assert!(!gpu_metrics_is_apu(&[]));
     }
 
     #[test]
