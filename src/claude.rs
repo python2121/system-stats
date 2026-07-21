@@ -446,16 +446,48 @@ pub fn open_in_terminal(
     }
 }
 
-// Terminal-window scripting is AppleScript-only for now, so on other
-// platforms the "open terminal here" / "new session" actions are silent
-// no-ops. A Linux launcher (gnome-terminal/kitty/alacritty spawns) would
-// slot in here without touching any caller.
+// Linux (and other non-mac): Ghostty ships CLI equivalents of everything
+// the AppleScript path uses — `--working-directory` for the cd, and
+// `--input` (since 1.2) which types the command into the shell the same
+// way `initial input` does on macOS, leaving an interactive shell behind
+// when it exits. Each launch is its own Ghostty process rather than a
+// window in the running instance: plain `ghostty` doesn't join a
+// single-instance app unless activated over D-Bus, and a fresh process
+// also works inside containers (distrobox) where the host session bus
+// may be out of reach. The other TerminalApp variants are macOS-only
+// apps — they can't be detected here, and the undetected-terminal
+// fallback maps to one of them, so they stay silent no-ops until a
+// generic Linux launcher exists.
 #[cfg(not(target_os = "macos"))]
 pub fn open_in_terminal(
-    _terminal: config::TerminalApp,
-    _dir: &Path,
-    _command: Option<&str>,
+    terminal: config::TerminalApp,
+    dir: &Path,
+    command: Option<&str>,
 ) {
+    if terminal != config::TerminalApp::Ghostty {
+        return;
+    }
+    let mut cmd = Command::new("ghostty");
+    cmd.arg(format!("--working-directory={}", dir.display()));
+    if let Some(c) = command {
+        // The value after `raw:` uses Zig string-literal escapes; the
+        // trailing `\n` presses Enter.
+        cmd.arg(format!("--input=raw:{}\\n", ghostty_input_escape(c)));
+    }
+    // A new process group keeps the long-lived window process out of the
+    // TUI's group so terminal signals aimed at the app can't reach it.
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    if let Ok(mut child) = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        // Reap the launcher on a background thread so it doesn't linger
+        // as a zombie for the app's lifetime.
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 // Open a new terminal window, cd into the project, and re-attach to a
@@ -477,6 +509,14 @@ fn shell_quote(s: &str) -> String {
 // Escape for embedding inside an AppleScript double-quoted string.
 #[cfg(target_os = "macos")]
 fn applescript_escape(s: &str) -> String {
+    s.replace('\\', r"\\").replace('"', "\\\"")
+}
+
+// Escape for Ghostty's `--input=raw:` value, which is parsed with Zig
+// string-literal rules — backslash and double-quote need escaping
+// (verified against Ghostty 1.3: `\"` → `"`, `\\` → `\`, `\n` → newline).
+#[cfg(not(target_os = "macos"))]
+fn ghostty_input_escape(s: &str) -> String {
     s.replace('\\', r"\\").replace('"', "\\\"")
 }
 
@@ -825,6 +865,16 @@ mod tests {
             r#"cd '/a/b' && claude --resume 'x\"y'"#,
         );
         assert_eq!(applescript_escape(r"back\slash"), r"back\\slash");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn ghostty_input_quoting() {
+        assert_eq!(
+            ghostty_input_escape(r#"claude --resume 'x"y'"#),
+            r#"claude --resume 'x\"y'"#,
+        );
+        assert_eq!(ghostty_input_escape(r"back\slash"), r"back\\slash");
     }
 
     #[test]
