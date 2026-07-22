@@ -490,6 +490,57 @@ pub fn open_in_terminal(
     }
 }
 
+// Open a directory as a folder in VS Code. `code <dir>` is the same CLI on
+// macOS and Linux; on macOS the shim isn't on PATH by default (it's opt-in
+// via "Shell Command: Install 'code' command in PATH"), so fall back to
+// launching the app bundle by name with `open -a`. Fire-and-forget, matching
+// open_in_terminal: the new window — or its absence — is its own feedback.
+#[cfg(target_os = "macos")]
+pub fn open_in_vscode(dir: &Path) {
+    let launch = |mut cmd: Command| {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    };
+    let mut c = Command::new("code");
+    c.arg(dir);
+    // A missing `code` shim fails to spawn (ENOENT); fall back to the bundle.
+    let child = launch(c).or_else(|_| {
+        let mut open = Command::new("open");
+        open.args(["-a", "Visual Studio Code"]).arg(dir);
+        launch(open)
+    });
+    if let Ok(mut child) = child {
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn open_in_vscode(dir: &Path) {
+    let mut cmd = Command::new("code");
+    cmd.arg(dir);
+    // Keep the editor process out of the TUI's process group so terminal
+    // signals aimed at the app can't reach it — same guard as the Ghostty
+    // launcher above.
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    if let Ok(mut child) = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
 // Open a new terminal window, cd into the project, and re-attach to a
 // session with `claude --resume`. Thin wrapper over open_in_terminal.
 pub fn resume_in_terminal(

@@ -102,20 +102,23 @@ enum RepoActionItem {
     Terminal,
     // Open a terminal at the repo dir and start a fresh `claude` session.
     Claude,
+    // Open the repo dir as a folder in VS Code (cross-platform `code` CLI).
+    VsCode,
     // Full-screen detailed commit graph for the repo.
     Inspect,
     // Background `git pull --ff-only`; status shows on the repo's row.
     Pull,
 }
 
-const REPO_ACTION_ITEMS: [RepoActionItem; 4] = [
+const REPO_ACTION_ITEMS: [RepoActionItem; 5] = [
     RepoActionItem::Terminal,
     RepoActionItem::Claude,
+    RepoActionItem::VsCode,
     RepoActionItem::Inspect,
     RepoActionItem::Pull,
 ];
-const REPO_ACTION_LABELS: [&str; 4] =
-    ["Open terminal here", "New Claude session", "Inspect git", "Git pull"];
+const REPO_ACTION_LABELS: [&str; 5] =
+    ["Open terminal here", "New Claude session", "Open in VS Code", "Inspect git", "Git pull"];
 
 // Small modal shown when the user hits Esc on the tab bar. Owns its own
 // cursor so nav keys can drive it independently of the pane focus underneath.
@@ -1163,6 +1166,9 @@ impl App {
                         RepoActionItem::Claude => {
                             claude::open_in_terminal(terminal, &path, Some("claude"));
                         }
+                        RepoActionItem::VsCode => {
+                            claude::open_in_vscode(&path);
+                        }
                         RepoActionItem::Inspect => {
                             // Graph + stats load lazily via ensure_graph_loaded
                             // on the next tick; a "loading …" frame shows if
@@ -1322,6 +1328,18 @@ impl App {
     }
 
     fn handle_main_key(&mut self, key: KeyEvent) {
+        // On the git status tab, 'r' forces an immediate rescan no matter
+        // which pane holds focus (activity list, graph, or full-screen
+        // inspect) — checked before the inspect handler, which otherwise
+        // swallows every unbound key. Skip when a modifier is held so
+        // Ctrl-C and friends still reach the shared handler.
+        if self.selected_tab == Tab::GitStatus
+            && key.code == KeyCode::Char('r')
+            && key.modifiers.is_empty()
+        {
+            self.scanner.rescan();
+            return;
+        }
         // The full-screen inspect view swallows everything except quit
         // while it's open.
         if self.selected_tab == Tab::GitStatus && self.handle_git_inspect_key(key) {
