@@ -1,6 +1,7 @@
 mod claude;
 mod config;
 mod git;
+mod graph;
 mod hardware;
 mod network;
 mod processes;
@@ -1992,93 +1993,20 @@ fn render_recent_commits(commits: &[RecentCommit]) -> Vec<Line<'static>> {
         .collect()
 }
 
-// Color the graph drawing column-by-column so each lane reads as a distinct
-// color. This is an approximation — git's lanes can shift columns at merges
-// and branches — but it's cheap and visually close to a true swim-lane view.
-// Palette borrowed from VSCode's GitHub Graph / GitHub's own PR graph:
-// blue leads (so `main` at column 0 gets the trunk color), then bright,
-// well-separated hues that read clearly on both dark and light backgrounds.
-const LANE_COLORS: [Color; 6] = [
-    Color::Rgb(88, 166, 255),  // blue    — #58A6FF (trunk)
-    Color::Rgb(247, 120, 186), // pink    — #F778BA
-    Color::Rgb(126, 231, 135), // green   — #7EE787
-    Color::Rgb(240, 184, 74),  // amber   — #F0B84A
-    Color::Rgb(163, 113, 247), // purple  — #A371F7
-    Color::Rgb(255, 122, 89),  // orange  — #FF7A59
-];
-
-fn lane_color(col: usize) -> Color {
-    LANE_COLORS[(col / 2) % LANE_COLORS.len()]
-}
-
-// Diagonals sit in the gap columns between two lanes. In git's `--graph`
-// output they always connect the lane on their right (the branch splitting
-// off or merging in), so color them with that lane's hue rather than the
-// trunk's. Without this the curves all read as blue.
-fn glyph_color(col: usize, ch: char) -> Color {
-    let effective_col = match ch {
-        '/' | '\\' => col + 1,
-        _ => col,
-    };
-    lane_color(effective_col)
-}
-
-// Turn one raw `git log --graph` glyph into its Unicode box-drawing sibling
-// so lanes read as smooth vertical rails and merges as ring nodes, à la
-// VSCode's GitHub Graph. `is_merge` only affects the commit glyph.
-fn beautify_glyph(ch: char, is_merge: bool) -> char {
-    match ch {
-        '*' => {
-            if is_merge {
-                '◉'
-            } else {
-                '●'
-            }
-        }
-        '|' => '│',
-        '/' => '╱',
-        '\\' => '╲',
-        '_' => '─',
-        c => c,
-    }
-}
-
-// Color one row's raw `git log --graph` prefix — ASCII glyphs swapped for
-// Unicode box-drawing siblings, colored by column so each lane reads as a
-// distinct swim lane. Shared by the compact and inspect graph renderers.
-fn graph_prefix_spans(row: &GraphRow) -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for (i, ch) in row.prefix.chars().enumerate() {
-        if ch == ' ' {
-            spans.push(Span::raw(" "));
-            continue;
-        }
-        let glyph = beautify_glyph(ch, row.is_merge);
-        let mut style = Style::default().fg(glyph_color(i, ch));
-        // Commit nodes are the visual anchors — bold makes them pop
-        // above the lane rails without changing width.
-        if ch == '*' {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        spans.push(Span::styled(glyph.to_string(), style));
-    }
-    spans
-}
-
 fn render_graph(rows: &[GraphRow]) -> Vec<Line<'static>> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    rows.iter()
-        .map(|row| {
-            let mut spans = graph_prefix_spans(row);
+    // Lane layout for the whole window at once — columns are stable
+    // across rows, so subjects line up after the widest lane.
+    let layout = graph::layout(rows);
 
-            // Connector-only rows (no commit on them) stop here.
-            if row.sha.is_none() {
-                return Line::from(spans);
-            }
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let mut spans = graph::prefix_spans(&layout, i);
 
             // Refs as colored chips, à la the screenshot.
             for r in &row.refs {
@@ -2163,7 +2091,7 @@ fn draw_git_inspect(f: &mut Frame, app: &App, area: Rect, name: &str) {
 
     let (title, lines) = match app.graph_cache.get(name) {
         Some(rows) => {
-            let commits = rows.iter().filter(|r| r.sha.is_some()).count();
+            let commits = rows.len();
             let title = format!(
                 " Inspect — {name} · {commits} commit{}  (↑/↓ scroll · Esc back) ",
                 if commits == 1 { "" } else { "s" },
@@ -2199,12 +2127,13 @@ fn render_inspect_graph(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    let layout = graph::layout(rows);
+
     rows.iter()
-        .map(|row| {
-            let mut spans = graph_prefix_spans(row);
-            let Some(sha) = &row.sha else {
-                return Line::from(spans);
-            };
+        .enumerate()
+        .map(|(i, row)| {
+            let mut spans = graph::prefix_spans(&layout, i);
+            let sha = &row.sha;
 
             spans.push(Span::raw(" "));
             spans.push(Span::styled(

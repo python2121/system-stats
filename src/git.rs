@@ -38,12 +38,14 @@ pub struct RecentCommit {
     pub subject: String,
 }
 
-// One row of the commit graph for a single repo.
-// `prefix` is the raw graph drawing from `git log --graph` (`* | \ /` etc).
-// If `sha` is None, this is a "connector" row with no commit on it.
+// One commit of the graph for a single repo. Lane layout is computed by
+// the renderer (src/graph.rs) from `parents`, not by `git log --graph` —
+// so there are no connector-only rows: one struct, one commit, one line.
 pub struct GraphRow {
-    pub prefix: String,
-    pub sha: Option<String>,
+    pub sha: String,
+    // Full parent shas, first parent first. Drives lane assignment and the
+    // merge ring-node glyph (`parents.len() > 1`).
+    pub parents: Vec<String>,
     pub timestamp: Option<u64>,
     // Committer date pre-formatted by git in the local timezone
     // ("2026-07-11 14:32") — saves us from doing tz math ourselves.
@@ -51,9 +53,6 @@ pub struct GraphRow {
     pub author: String,
     pub subject: String,
     pub refs: Vec<String>,
-    // True when the commit has >1 parent — drives the ring-node glyph
-    // in the graph renderer.
-    pub is_merge: bool,
 }
 
 pub struct RepoSummary {
@@ -651,17 +650,19 @@ fn parse_track(s: &str) -> (usize, usize) {
 pub fn graph(repo_dir: &Path) -> Vec<GraphRow> {
     // `\x1f` (unit separator) is used between fields so subjects / refs can
     // contain anything printable without breaking parsing.
+    // `--date-order` keeps the topological guarantee (children always
+    // precede parents) that the lane engine in graph.rs relies on, while
+    // interleaving branches by commit time like every graph viewer does.
     let out = match Command::new("git")
         .arg("-C")
         .arg(repo_dir)
         .args([
             "log",
             "--all",
-            "--graph",
             "--date-order",
             "--decorate=short",
             "--date=format-local:%Y-%m-%d %H:%M",
-            "--format=%x00%H%x1f%ct%x1f%an%x1f%s%x1f%D%x1f%P%x1f%cd",
+            "--format=%H%x1f%ct%x1f%an%x1f%s%x1f%D%x1f%P%x1f%cd",
             &format!("-n{GRAPH_MAX_ROWS}"),
         ])
         .output()
@@ -671,26 +672,15 @@ pub fn graph(repo_dir: &Path) -> Vec<GraphRow> {
     };
 
     let text = String::from_utf8_lossy(&out.stdout);
-    text.lines().map(parse_graph_line).collect()
+    text.lines().filter_map(parse_graph_line).collect()
 }
 
-fn parse_graph_line(line: &str) -> GraphRow {
-    // Lines without a NUL marker are pure graph connectors (`|\`, `|/`, etc).
-    let Some((prefix, payload)) = line.split_once('\x00') else {
-        return GraphRow {
-            prefix: line.to_string(),
-            sha: None,
-            timestamp: None,
-            date: String::new(),
-            author: String::new(),
-            subject: String::new(),
-            refs: Vec::new(),
-            is_merge: false,
-        };
-    };
-
-    let mut parts = payload.split('\x1f');
+fn parse_graph_line(line: &str) -> Option<GraphRow> {
+    let mut parts = line.split('\x1f');
     let sha = parts.next().unwrap_or("").to_string();
+    if sha.is_empty() {
+        return None;
+    }
     let ts: Option<u64> = parts.next().and_then(|s| s.parse().ok());
     let author = parts.next().unwrap_or("").to_string();
     let subject = parts.next().unwrap_or("").to_string();
@@ -703,18 +693,20 @@ fn parse_graph_line(line: &str) -> GraphRow {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    let is_merge = parents_raw.split_whitespace().count() > 1;
+    let parents: Vec<String> = parents_raw
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
 
-    GraphRow {
-        prefix: prefix.to_string(),
-        sha: Some(sha),
+    Some(GraphRow {
+        sha,
+        parents,
         timestamp: ts,
         date,
         author,
         subject,
         refs,
-        is_merge,
-    }
+    })
 }
 
 pub struct CommitStat {
