@@ -127,18 +127,13 @@ struct Menu {
     selected: usize,
 }
 
+// Label of the always-last RepoAction entry that opens the ActionPrompt.
+const CUSTOM_ACTION_LABEL: &str = "Custom…";
+
 impl Menu {
     fn main() -> Self { Self { kind: MenuKind::Main, selected: 0 } }
     fn settings() -> Self { Self { kind: MenuKind::Settings, selected: 0 } }
     fn repo_action() -> Self { Self { kind: MenuKind::RepoAction, selected: 0 } }
-
-    fn labels(&self) -> &'static [&'static str] {
-        match self.kind {
-            MenuKind::Main => &MAIN_LABELS,
-            MenuKind::Settings => &SETTINGS_LABELS,
-            MenuKind::RepoAction => &REPO_ACTION_LABELS,
-        }
-    }
 
     fn title(&self) -> &'static str {
         match self.kind {
@@ -149,23 +144,23 @@ impl Menu {
     }
 }
 
-// Modal for picking / changing the watched directory. Non-cancelable on
-// first launch (can_cancel = false) so we always end up with a config file
-// on disk; cancelable when opened from Settings so Esc is a real out.
-struct DirectoryPrompt {
+// Unicode-safe single-line editor state, shared by every modal that takes
+// typed input (the directory prompt, both custom-action fields).
+struct InputLine {
     input: String,
     // Char position (not byte) — 0..=char_count. Kept unicode-safe so a
-    // path with multi-byte chars doesn't panic on Backspace.
+    // string with multi-byte chars doesn't panic on Backspace.
     cursor: usize,
-    error: Option<String>,
-    can_cancel: bool,
 }
 
-impl DirectoryPrompt {
-    fn new(current: &Path, can_cancel: bool) -> Self {
-        let input = config::display_path(current);
+impl InputLine {
+    fn new(input: String) -> Self {
         let cursor = input.chars().count();
-        Self { input, cursor, error: None, can_cancel }
+        Self { input, cursor }
+    }
+
+    fn empty() -> Self {
+        Self { input: String::new(), cursor: 0 }
     }
 
     fn char_count(&self) -> usize {
@@ -184,7 +179,6 @@ impl DirectoryPrompt {
         let i = self.byte_at(self.cursor);
         self.input.insert(i, ch);
         self.cursor += 1;
-        self.error = None;
     }
 
     fn backspace(&mut self) {
@@ -193,7 +187,6 @@ impl DirectoryPrompt {
             let start = self.byte_at(self.cursor - 1);
             self.input.replace_range(start..end, "");
             self.cursor -= 1;
-            self.error = None;
         }
     }
 
@@ -202,7 +195,6 @@ impl DirectoryPrompt {
             let start = self.byte_at(self.cursor);
             let end = self.byte_at(self.cursor + 1);
             self.input.replace_range(start..end, "");
-            self.error = None;
         }
     }
 
@@ -222,7 +214,6 @@ impl DirectoryPrompt {
     fn clear_line(&mut self) {
         self.input.clear();
         self.cursor = 0;
-        self.error = None;
     }
 
     // Ctrl-W: kill the whitespace-bounded word to the left of the cursor,
@@ -242,7 +233,25 @@ impl DirectoryPrompt {
             let end = self.byte_at(self.cursor);
             self.input.replace_range(start..end, "");
             self.cursor = i;
-            self.error = None;
+        }
+    }
+}
+
+// Modal for picking / changing the watched directory. Non-cancelable on
+// first launch (can_cancel = false) so we always end up with a config file
+// on disk; cancelable when opened from Settings so Esc is a real out.
+struct DirectoryPrompt {
+    line: InputLine,
+    error: Option<String>,
+    can_cancel: bool,
+}
+
+impl DirectoryPrompt {
+    fn new(current: &Path, can_cancel: bool) -> Self {
+        Self {
+            line: InputLine::new(config::display_path(current)),
+            error: None,
+            can_cancel,
         }
     }
 
@@ -250,13 +259,83 @@ impl DirectoryPrompt {
     // Expands `~`, then anchors any leftover relative path to CWD so the
     // saved setting doesn't depend on where the app was launched from.
     fn resolved_path(&self) -> PathBuf {
-        let expanded = config::expand_tilde(self.input.trim());
+        let expanded = config::expand_tilde(self.line.input.trim());
         if expanded.is_absolute() {
             expanded
         } else {
             std::env::current_dir()
                 .map(|cwd| cwd.join(&expanded))
                 .unwrap_or(expanded)
+        }
+    }
+}
+
+// Focus stops inside the ActionPrompt, top to bottom: two text fields and
+// the close-terminal checkbox. Tab wraps around; Up/Down stop at the ends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActionField {
+    Name,
+    Command,
+    CloseToggle,
+}
+
+impl ActionField {
+    fn next(self) -> Self {
+        match self {
+            ActionField::Name => ActionField::Command,
+            ActionField::Command => ActionField::CloseToggle,
+            ActionField::CloseToggle => ActionField::Name,
+        }
+    }
+
+    fn prev(self) -> Self {
+        self.next().next()
+    }
+
+    fn up(self) -> Self {
+        match self {
+            ActionField::Name => ActionField::Name,
+            ActionField::Command => ActionField::Name,
+            ActionField::CloseToggle => ActionField::Command,
+        }
+    }
+
+    fn down(self) -> Self {
+        match self {
+            ActionField::Name => ActionField::Command,
+            ActionField::Command | ActionField::CloseToggle => {
+                ActionField::CloseToggle
+            }
+        }
+    }
+}
+
+// Modal for adding a custom repo action — e.g. name "build and run",
+// command "./build.sh && open App.app". Opened from the "Custom…" entry at
+// the bottom of the repo action menu; saving appends the action to the
+// config file so it survives restarts and rebuilds.
+struct ActionPrompt {
+    repo_name: String,
+    repo_path: PathBuf,
+    name: InputLine,
+    command: InputLine,
+    // Space-toggled checkbox: close the spawned terminal window once the
+    // command succeeds.
+    close_on_exit: bool,
+    field: ActionField,
+    error: Option<String>,
+}
+
+impl ActionPrompt {
+    fn new(repo_name: String, repo_path: PathBuf) -> Self {
+        Self {
+            repo_name,
+            repo_path,
+            name: InputLine::empty(),
+            command: InputLine::empty(),
+            close_on_exit: false,
+            field: ActionField::Name,
+            error: None,
         }
     }
 }
@@ -362,6 +441,10 @@ struct App {
     // above the menu stack — closing it drops the user back onto whichever
     // menu was topmost, so Esc-out-of-prompt naturally returns to Settings.
     dir_prompt: Option<DirectoryPrompt>,
+    // When Some, the custom-action editor is open. Same layering as
+    // dir_prompt: the repo action menu stays on the stack underneath, so
+    // closing the editor (save or Esc) drops back onto that menu.
+    action_prompt: Option<ActionPrompt>,
     // The terminal emulator this session runs inside, detected fresh at
     // every launch (never persisted, so it follows the user across
     // terminal apps). None under tmux or editor-embedded terminals.
@@ -422,6 +505,7 @@ impl App {
             claude_detail_scroll: Cell::new(0),
             menu_stack: Vec::new(),
             dir_prompt,
+            action_prompt: None,
             terminal: config::detect_terminal(),
             should_quit: false,
         }
@@ -1115,12 +1199,81 @@ impl App {
         }
     }
 
+    // The (name, path) of the repo the cursor is on, resolved fresh from
+    // the current tree — a rescan could have reordered or dropped it.
+    fn selected_repo_info(&self) -> Option<(String, PathBuf)> {
+        self.git_tree
+            .as_ref()
+            .zip(self.selected_repo)
+            .and_then(|(tree, i)| tree.repos.get(i))
+            .map(|r| (r.name.clone(), r.path.clone()))
+    }
+
+    // The labels for a menu level. Owned because the RepoAction level is
+    // dynamic: built-in actions, then the selected repo's custom actions,
+    // then the "Custom…" entry that opens the editor.
+    fn menu_labels(&self, menu: &Menu) -> Vec<String> {
+        match menu.kind {
+            MenuKind::Main => MAIN_LABELS.iter().map(|s| s.to_string()).collect(),
+            MenuKind::Settings => {
+                SETTINGS_LABELS.iter().map(|s| s.to_string()).collect()
+            }
+            MenuKind::RepoAction => {
+                let mut labels: Vec<String> =
+                    REPO_ACTION_LABELS.iter().map(|s| s.to_string()).collect();
+                if let Some((_, path)) = self.selected_repo_info() {
+                    labels.extend(
+                        self.config.actions_for(&path).map(|a| a.name.clone()),
+                    );
+                }
+                labels.push(CUSTOM_ACTION_LABEL.to_string());
+                labels
+            }
+        }
+    }
+
     fn menu_move(&mut self, delta: i32) {
-        let Some(top) = self.menu_stack.last_mut() else { return };
-        let n = top.labels().len() as i32;
+        let Some(top) = self.menu_stack.last() else { return };
+        let n = self.menu_labels(top).len() as i32;
         if n == 0 { return; }
-        let next = (top.selected as i32 + delta).clamp(0, n - 1);
-        top.selected = next as usize;
+        let next = (top.selected as i32 + delta).clamp(0, n - 1) as usize;
+        if let Some(top) = self.menu_stack.last_mut() {
+            top.selected = next;
+        }
+    }
+
+    // `d` on a highlighted custom action removes it from the config (and
+    // disk). Inert on built-in items and the "Custom…" entry.
+    fn menu_delete_custom(&mut self) {
+        let Some(top) = self.menu_stack.last() else { return };
+        if top.kind != MenuKind::RepoAction {
+            return;
+        }
+        let selected = top.selected;
+        let Some((_, path)) = self.selected_repo_info() else { return };
+        // Map the menu row back to an index in config.custom_actions —
+        // the menu shows only this repo's actions, the config holds all.
+        let indices: Vec<usize> = self
+            .config
+            .custom_actions
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.repo_path == path)
+            .map(|(i, _)| i)
+            .collect();
+        let n_builtin = REPO_ACTION_ITEMS.len();
+        if selected < n_builtin || selected >= n_builtin + indices.len() {
+            return;
+        }
+        let mut new_config = self.config.clone();
+        new_config.custom_actions.remove(indices[selected - n_builtin]);
+        // A failed write keeps the in-memory list too, so the menu never
+        // shows a state that isn't on disk.
+        if new_config.save().is_ok() {
+            self.config = new_config;
+            // Re-clamp the cursor now that the list shrank.
+            self.menu_move(0);
+        }
     }
 
     fn menu_activate(&mut self) {
@@ -1150,15 +1303,19 @@ impl App {
                 // Resolve the selected repo fresh — a rescan could have
                 // dropped it while the menu was open. Reuse the same
                 // detected-terminal fallback as the Claude-resume path.
-                let repo = self
-                    .git_tree
-                    .as_ref()
-                    .zip(self.selected_repo)
-                    .and_then(|(tree, i)| tree.repos.get(i))
-                    .map(|r| (r.name.clone(), r.path.clone()));
-                if let Some((name, path)) = repo {
-                    let terminal =
-                        self.terminal.unwrap_or(config::TerminalApp::TerminalApp);
+                let Some((name, path)) = self.selected_repo_info() else {
+                    self.menu_stack.pop();
+                    return;
+                };
+                let terminal =
+                    self.terminal.unwrap_or(config::TerminalApp::TerminalApp);
+                let n_builtin = REPO_ACTION_ITEMS.len();
+                let customs: Vec<(String, bool)> = self
+                    .config
+                    .actions_for(&path)
+                    .map(|a| (a.command.clone(), a.close_on_exit))
+                    .collect();
+                if selected < n_builtin {
                     match REPO_ACTION_ITEMS[selected] {
                         RepoActionItem::Terminal => {
                             claude::open_in_terminal(terminal, &path, None);
@@ -1182,8 +1339,28 @@ impl App {
                                 Some(PullState::Running { repo: name, rx });
                         }
                     }
+                } else if let Some((cmd, close)) = customs.get(selected - n_builtin) {
+                    // A custom action runs in a fresh terminal window at the
+                    // repo dir, so its output is visible — same plumbing as
+                    // the Claude entry. With the close flag the shell exits
+                    // (and the window closes) once the whole command
+                    // succeeds; `&&` rather than `;` so a failure leaves the
+                    // window open with the error output. The parens make the
+                    // exit hinge on the full chain, not its last segment.
+                    let cmd = if *close {
+                        format!("({cmd}) && exit")
+                    } else {
+                        cmd.clone()
+                    };
+                    claude::open_in_terminal(terminal, &path, Some(&cmd));
+                } else {
+                    // The trailing "Custom…" entry. Leave the menu on the
+                    // stack so closing the editor drops back onto it, with
+                    // the new action visible in the list.
+                    self.action_prompt = Some(ActionPrompt::new(name, path));
+                    return;
                 }
-                // Single-level menu — pop it so we return to the Git tab.
+                // Pop so we return to the Git tab.
                 self.menu_stack.pop();
             }
         }
@@ -1253,6 +1430,10 @@ impl App {
             self.handle_prompt_key(key);
             return Ok(());
         }
+        if self.action_prompt.is_some() {
+            self.handle_action_prompt_key(key);
+            return Ok(());
+        }
         if !self.menu_stack.is_empty() {
             self.handle_menu_key(key);
             return Ok(());
@@ -1269,8 +1450,39 @@ impl App {
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.menu_move(-1),
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.menu_move(1),
             (KeyCode::Enter, _) => self.menu_activate(),
+            // Delete the highlighted custom action (repo menu only).
+            (KeyCode::Char('d'), m) if m.is_empty() => self.menu_delete_custom(),
             _ => {}
         }
+    }
+
+    // Route a key to a text-editing operation, shared by both prompts.
+    // Returns true when the key was an edit (the caller then clears its
+    // modal's error) and false for keys that aren't line-editing (Enter,
+    // Esc, Tab, …) so the caller can give them modal-specific meanings.
+    fn apply_line_edit(line: &mut InputLine, key: KeyEvent) -> bool {
+        let ctrl = KeyModifiers::CONTROL;
+        match (key.code, key.modifiers) {
+            (KeyCode::Backspace, _) => line.backspace(),
+            (KeyCode::Delete, _) => line.delete(),
+            (KeyCode::Left, _) => line.move_left(),
+            (KeyCode::Right, _) => line.move_right(),
+            (KeyCode::Home, _) => line.home(),
+            (KeyCode::End, _) => line.end(),
+            // Readline-style bindings — expected reflexes for anyone who's
+            // used bash/zsh/emacs. Callers handle Ctrl-C before this runs.
+            (KeyCode::Char('a'), m) if m == ctrl => line.home(),
+            (KeyCode::Char('e'), m) if m == ctrl => line.end(),
+            (KeyCode::Char('u'), m) if m == ctrl => line.clear_line(),
+            (KeyCode::Char('w'), m) if m == ctrl => line.kill_word_back(),
+            (KeyCode::Char(c), m)
+                if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                line.insert(c);
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn handle_prompt_key(&mut self, key: KeyEvent) {
@@ -1281,49 +1493,119 @@ impl App {
             .as_ref()
             .map(|p| p.can_cancel)
             .unwrap_or(false);
-        let ctrl = KeyModifiers::CONTROL;
         match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), m) if m == ctrl => self.should_quit = true,
+            (KeyCode::Char('c'), m) if m == KeyModifiers::CONTROL => {
+                self.should_quit = true;
+            }
             (KeyCode::Esc, _) if can_cancel => self.dir_prompt = None,
             (KeyCode::Enter, _) => self.submit_dir_prompt(),
-            (KeyCode::Backspace, _) => {
-                if let Some(p) = self.dir_prompt.as_mut() { p.backspace(); }
+            _ => {
+                if let Some(p) = self.dir_prompt.as_mut()
+                    && Self::apply_line_edit(&mut p.line, key)
+                {
+                    p.error = None;
+                }
             }
-            (KeyCode::Delete, _) => {
-                if let Some(p) = self.dir_prompt.as_mut() { p.delete(); }
+        }
+    }
+
+    fn handle_action_prompt_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), m) if m == KeyModifiers::CONTROL => {
+                self.should_quit = true;
             }
-            (KeyCode::Left, _) => {
-                if let Some(p) = self.dir_prompt.as_mut() { p.move_left(); }
+            // Cancel without saving; the repo action menu is still on the
+            // stack underneath.
+            (KeyCode::Esc, _) => self.action_prompt = None,
+            (KeyCode::Enter, _) => self.submit_action_prompt(),
+            // Move between the fields. Up/Down mirror the on-screen order;
+            // Tab/Shift-Tab cycle with wraparound.
+            (KeyCode::Tab, _) => {
+                if let Some(p) = self.action_prompt.as_mut() {
+                    p.field = p.field.next();
+                }
             }
-            (KeyCode::Right, _) => {
-                if let Some(p) = self.dir_prompt.as_mut() { p.move_right(); }
+            (KeyCode::BackTab, _) => {
+                if let Some(p) = self.action_prompt.as_mut() {
+                    p.field = p.field.prev();
+                }
             }
-            (KeyCode::Home, _) => {
-                if let Some(p) = self.dir_prompt.as_mut() { p.home(); }
+            (KeyCode::Up, _) => {
+                if let Some(p) = self.action_prompt.as_mut() {
+                    p.field = p.field.up();
+                }
             }
-            (KeyCode::End, _) => {
-                if let Some(p) = self.dir_prompt.as_mut() { p.end(); }
+            (KeyCode::Down, _) => {
+                if let Some(p) = self.action_prompt.as_mut() {
+                    p.field = p.field.down();
+                }
             }
-            // Readline-style bindings — expected reflexes for anyone who's
-            // used bash/zsh/emacs. Ctrl-C is handled above and takes priority.
-            (KeyCode::Char('a'), m) if m == ctrl => {
-                if let Some(p) = self.dir_prompt.as_mut() { p.home(); }
+            _ => {
+                if let Some(p) = self.action_prompt.as_mut() {
+                    let edited = match p.field {
+                        ActionField::Name => {
+                            Self::apply_line_edit(&mut p.name, key)
+                        }
+                        ActionField::Command => {
+                            Self::apply_line_edit(&mut p.command, key)
+                        }
+                        ActionField::CloseToggle => {
+                            if key.code == KeyCode::Char(' ') {
+                                p.close_on_exit = !p.close_on_exit;
+                            }
+                            false
+                        }
+                    };
+                    if edited {
+                        p.error = None;
+                    }
+                }
             }
-            (KeyCode::Char('e'), m) if m == ctrl => {
-                if let Some(p) = self.dir_prompt.as_mut() { p.end(); }
-            }
-            (KeyCode::Char('u'), m) if m == ctrl => {
-                if let Some(p) = self.dir_prompt.as_mut() { p.clear_line(); }
-            }
-            (KeyCode::Char('w'), m) if m == ctrl => {
-                if let Some(p) = self.dir_prompt.as_mut() { p.kill_word_back(); }
-            }
-            (KeyCode::Char(c), m)
-                if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                if let Some(p) = self.dir_prompt.as_mut() { p.insert(c); }
-            }
-            _ => {}
+        }
+    }
+
+    // Commit the action editor: validate → append to config → write to disk.
+    // Failures leave the editor open with an error so nothing is lost.
+    fn submit_action_prompt(&mut self) {
+        let Some(prompt) = self.action_prompt.as_mut() else { return };
+        let name = prompt.name.input.trim().to_string();
+        let command = prompt.command.input.trim().to_string();
+        if name.is_empty() {
+            prompt.error = Some("name is empty".to_string());
+            prompt.field = ActionField::Name;
+            return;
+        }
+        if command.is_empty() {
+            prompt.error = Some("command is empty".to_string());
+            prompt.field = ActionField::Command;
+            return;
+        }
+        let mut new_config = self.config.clone();
+        new_config.custom_actions.push(config::CustomAction {
+            repo_path: prompt.repo_path.clone(),
+            name,
+            command,
+            close_on_exit: prompt.close_on_exit,
+        });
+        if let Err(e) = new_config.save() {
+            prompt.error = Some(format!("failed to save config: {e}"));
+            return;
+        }
+        let repo_path = prompt.repo_path.clone();
+        self.config = new_config;
+        self.action_prompt = None;
+        // Land the menu cursor on the action that was just added so Enter
+        // can run it immediately.
+        if let Some(top) = self.menu_stack.last_mut()
+            && top.kind == MenuKind::RepoAction
+        {
+            let n_customs = self
+                .config
+                .custom_actions
+                .iter()
+                .filter(|a| a.repo_path == repo_path)
+                .count();
+            top.selected = REPO_ACTION_ITEMS.len() + n_customs - 1;
         }
     }
 
@@ -1482,8 +1764,12 @@ fn draw(f: &mut Frame, app: &App) {
     if !app.menu_stack.is_empty() {
         draw_menu(f, app);
     }
-    // Drawn last so it sits above the menu; if both were ever open at
-    // once the prompt wins (matches handle_events priority).
+    // Prompts drawn after the menu so they sit above it; the repo action
+    // menu stays on the stack while the action editor is open. Ordering
+    // matches handle_events priority.
+    if app.action_prompt.is_some() {
+        draw_action_prompt(f, app);
+    }
     if app.dir_prompt.is_some() {
         draw_directory_prompt(f, app);
     }
@@ -1522,7 +1808,7 @@ fn draw_directory_prompt(f: &mut Frame, app: &App) {
     let inner_width = area.width.saturating_sub(2) as usize;
     let input_area_width = inner_width.saturating_sub(label_len);
     let (visible, cursor_offset) =
-        input_window(&prompt.input, prompt.cursor, input_area_width);
+        input_window(&prompt.line.input, prompt.line.cursor, input_area_width);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(""));
@@ -1588,15 +1874,104 @@ fn input_window(input: &str, cursor: usize, width: usize) -> (String, usize) {
     (visible, cursor - start)
 }
 
+// Modal for adding a custom repo action: a name field (the menu label), a
+// command field (run verbatim in a shell at the repo dir), and the
+// close-terminal checkbox. Same layout conventions as the directory prompt.
+fn draw_action_prompt(f: &mut Frame, app: &App) {
+    let Some(prompt) = &app.action_prompt else { return };
+
+    let full = f.area();
+    let width = full.width.clamp(40, 72);
+    let height: u16 = if prompt.error.is_some() { 11 } else { 9 };
+    let area = centered_rect(width, height, full);
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(" Custom action — {} ", prompt.repo_name));
+
+    // Equal-width labels keep the two input windows column-aligned.
+    let labels = ["Name:    ", "Command: "];
+    let label_len = labels[0].chars().count();
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let input_area_width = inner_width.saturating_sub(label_len);
+
+    let active_style = Style::default().fg(Color::Cyan);
+    let idle_style = Style::default().fg(Color::DarkGray);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(""));
+    let mut cursor_pos: Option<Position> = None;
+    let text_fields = [
+        (&prompt.name, ActionField::Name),
+        (&prompt.command, ActionField::Command),
+    ];
+    for (i, (field, id)) in text_fields.into_iter().enumerate() {
+        let active = prompt.field == id;
+        let (visible, cursor_offset) =
+            input_window(&field.input, field.cursor, input_area_width);
+        lines.push(Line::from(vec![
+            Span::styled(labels[i], if active { active_style } else { idle_style }),
+            Span::raw(visible),
+        ]));
+        // Blink the terminal cursor in the active text field only (the
+        // checkbox has no caret). Row 0 inside the block is blank; the
+        // fields sit on rows 1 and 2.
+        if active && input_area_width > 0 {
+            cursor_pos = Some(Position {
+                x: area.x + 1 + label_len as u16 + cursor_offset as u16,
+                y: area.y + 2 + i as u16,
+            });
+        }
+    }
+    let on_toggle = prompt.field == ActionField::CloseToggle;
+    lines.push(Line::from(Span::styled(
+        format!(
+            "[{}] Close terminal on success",
+            if prompt.close_on_exit { "x" } else { " " },
+        ),
+        if on_toggle { active_style } else { idle_style },
+    )));
+    if let Some(err) = &prompt.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            err.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    let hint = if on_toggle {
+        "Space to toggle · Enter to save · Esc to cancel"
+    } else {
+        "Enter to save · Esc to cancel · Tab to switch fields"
+    };
+    lines.push(Line::from(Span::styled(hint, idle_style)));
+
+    let para = Paragraph::new(lines).style(Style::reset()).block(block);
+    f.render_widget(para, area);
+    if let Some(pos) = cursor_pos {
+        f.set_cursor_position(pos);
+    }
+}
+
 fn draw_menu(f: &mut Frame, app: &App) {
     // Draw the top-of-stack level. Lower levels sit behind it; when this
     // one pops on Esc, the next tick redraws whichever was underneath.
     let Some(menu) = app.menu_stack.last() else { return };
-    let labels = menu.labels();
-    // Size the modal to the item count so a single-item Settings menu
-    // doesn't look empty at the same height as a fuller menu.
-    let height = (labels.len() as u16 + 4).max(5);
-    let area = centered_rect(28, height, f.area());
+    let labels = app.menu_labels(menu);
+    // The repo menu gets a footer hint once it has deletable custom rows.
+    let n_customs = labels.len().saturating_sub(REPO_ACTION_ITEMS.len() + 1);
+    let footer = (menu.kind == MenuKind::RepoAction && n_customs > 0)
+        .then_some("d deletes a custom action");
+    // Size the modal to its content: a single-item Settings menu doesn't
+    // look empty at a fuller menu's height, and a long custom-action name
+    // widens the box instead of truncating.
+    let height =
+        (labels.len() as u16 + 4 + if footer.is_some() { 1 } else { 0 }).max(5);
+    let max_label = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let width = (max_label as u16 + 6).max(28);
+    let area = centered_rect(width, height, f.area());
     // Clear underneath so the menu isn't blended with what's below.
     f.render_widget(Clear, area);
 
@@ -1605,7 +1980,7 @@ fn draw_menu(f: &mut Frame, app: &App) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(menu.title());
 
-    let lines: Vec<Line<'static>> = labels
+    let mut lines: Vec<Line<'static>> = labels
         .iter()
         .enumerate()
         .map(|(i, label)| {
@@ -1620,10 +1995,17 @@ fn draw_menu(f: &mut Frame, app: &App) {
             };
             Line::from(vec![
                 Span::styled(marker, style),
-                Span::styled((*label).to_string(), style),
+                Span::styled(label.clone(), style),
             ])
         })
         .collect();
+    if let Some(hint) = footer {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 
     let para = Paragraph::new(lines)
         .style(Style::reset())
