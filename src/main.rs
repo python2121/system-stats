@@ -698,14 +698,58 @@ impl App {
         self.left_scroll = next as u16;
     }
 
+    fn set_tab(&mut self, tab: Tab) {
+        self.selected_tab = tab;
+        // The Claude scanner runs twice as fast while its tab is showing.
+        self.claude_scanner.set_focused(tab == Tab::Claude);
+    }
+
     fn cycle_tab(&mut self, delta: i32) {
         let n = TABS.len() as i32;
         let cur = self.selected_tab.index() as i32;
         let next = (cur + delta).clamp(0, n - 1) as usize;
-        self.selected_tab = TABS[next];
-        // The Claude scanner runs twice as fast while its tab is showing.
-        self.claude_scanner
-            .set_focused(self.selected_tab == Tab::Claude);
+        self.set_tab(TABS[next]);
+    }
+
+    // The direction Tab/Shift-Tab asks for, or None for any other key.
+    // Shift-Tab reaches us as BackTab on most terminals but as Tab with
+    // SHIFT held on some, so both spellings count as "backwards".
+    fn tab_cycle_delta(key: KeyEvent) -> Option<i32> {
+        match key.code {
+            KeyCode::BackTab => Some(-1),
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => Some(-1),
+            KeyCode::Tab => Some(1),
+            _ => None,
+        }
+    }
+
+    // Tab/Shift-Tab cycling, live from anywhere in the app: it wraps at
+    // both ends (unlike the arrow keys on the tab bar, which clamp) and
+    // tears down whatever drill-down state the old tab was holding, so
+    // the new tab always opens at its top level with the bar focused.
+    fn switch_tab(&mut self, delta: i32) {
+        let n = TABS.len() as i32;
+        let next = (self.selected_tab.index() as i32 + delta).rem_euclid(n) as usize;
+        self.set_tab(TABS[next]);
+        self.reset_tab_state();
+    }
+
+    // Drop every per-tab cursor, scroll and detail view — the same state
+    // Esc unwinds one level at a time.
+    fn reset_tab_state(&mut self) {
+        self.git_inspect = None;
+        self.inspect_scroll = 0;
+        self.selected_repo = None;
+        self.left_scroll = 0;
+        self.right_scroll.set(0);
+        self.net_detail = None;
+        self.net_selected = None;
+        self.proc_detail = None;
+        self.proc_selected = None;
+        self.claude_detail = None;
+        self.claude_selected = None;
+        self.claude_session_selected = None;
+        self.focus = Focus::Tabs;
     }
 
     // Entering the git-activity pane from tabs: land the cursor on the top repo
@@ -1443,6 +1487,14 @@ impl App {
     }
 
     fn handle_menu_key(&mut self, key: KeyEvent) {
+        // Tab cycling stays global even with a menu open: it dismisses
+        // the whole stack and moves on. The text prompts keep Tab for
+        // their own field cycling — they're the one place it's taken.
+        if let Some(delta) = Self::tab_cycle_delta(key) {
+            self.menu_stack.clear();
+            self.switch_tab(delta);
+            return;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
             // Esc pops one level — Settings → Main → app.
@@ -1610,6 +1662,13 @@ impl App {
     }
 
     fn handle_main_key(&mut self, key: KeyEvent) {
+        // Tab/Shift-Tab move between top-level tabs from anywhere —
+        // checked first so the per-tab handlers below, several of which
+        // swallow every unbound key, can't eat it.
+        if let Some(delta) = Self::tab_cycle_delta(key) {
+            self.switch_tab(delta);
+            return;
+        }
         // On the git status tab, 'r' forces an immediate rescan no matter
         // which pane holds focus (activity list, graph, or full-screen
         // inspect) — checked before the inspect handler, which otherwise
