@@ -541,6 +541,70 @@ pub fn open_in_vscode(dir: &Path) {
     }
 }
 
+// Open the repo directory in the desktop's file manager. On macOS `open
+// <dir>` is the whole story: Finder is the registered handler for a folder,
+// and it opens the directory itself rather than selecting it in its parent
+// (which is what `open -R` would do).
+#[cfg(target_os = "macos")]
+pub fn reveal_in_file_manager(dir: &Path) {
+    let mut cmd = Command::new("open");
+    cmd.arg(dir);
+    if let Ok(mut child) = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
+// Linux (and other non-mac): `xdg-open` on a directory resolves the
+// inode/directory handler from the desktop's MIME database, so KDE gets
+// Dolphin, GNOME gets Nautilus, XFCE gets Thunar — no desktop sniffing here.
+// Under distrobox `xdg-open` is a symlink to distrobox-host-exec, so the
+// request is forwarded to the host session and the window opens on the real
+// desktop rather than failing inside the container.
+//
+// The fallbacks only trigger on spawn failure (ENOENT — the binary isn't
+// installed), not on a handler that launches and then does nothing; the
+// window, or its absence, is the feedback, same as the other launchers here.
+#[cfg(not(target_os = "macos"))]
+pub fn reveal_in_file_manager(dir: &Path) {
+    // `gio open` is the same MIME lookup via GLib, and is present on most
+    // systems that have any GTK/KDE stack even when xdg-utils isn't. The
+    // named managers are a last resort for minimal installs.
+    const LAUNCHERS: [&str; 6] =
+        ["xdg-open", "gio", "dolphin", "nautilus", "thunar", "nemo"];
+    for name in LAUNCHERS {
+        let mut cmd = Command::new(name);
+        if name == "gio" {
+            cmd.arg("open");
+        }
+        cmd.arg(dir);
+        // Keep the file manager out of the TUI's process group so terminal
+        // signals aimed at the app can't reach it — same guard as the
+        // Ghostty and VS Code launchers above.
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        if let Ok(mut child) = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+            return;
+        }
+    }
+}
+
 // Open a new terminal window, cd into the project, and re-attach to a
 // session with `claude --resume`. Thin wrapper over open_in_terminal.
 pub fn resume_in_terminal(

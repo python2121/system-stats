@@ -104,21 +104,30 @@ enum RepoActionItem {
     Claude,
     // Open the repo dir as a folder in VS Code (cross-platform `code` CLI).
     VsCode,
+    // Open the repo dir in the desktop's file manager (Finder / Dolphin / …).
+    Reveal,
     // Full-screen detailed commit graph for the repo.
     Inspect,
     // Background `git pull --ff-only`; status shows on the repo's row.
     Pull,
 }
 
-const REPO_ACTION_ITEMS: [RepoActionItem; 5] = [
+const REPO_ACTION_ITEMS: [RepoActionItem; 6] = [
     RepoActionItem::Terminal,
     RepoActionItem::Claude,
     RepoActionItem::VsCode,
+    RepoActionItem::Reveal,
     RepoActionItem::Inspect,
     RepoActionItem::Pull,
 ];
-const REPO_ACTION_LABELS: [&str; 5] =
-    ["Open terminal here", "New Claude session", "Open in VS Code", "Inspect git", "Git pull"];
+const REPO_ACTION_LABELS: [&str; 6] = [
+    "Open terminal here",
+    "New Claude session",
+    "Open in VS Code",
+    "Reveal files",
+    "Inspect git",
+    "Git pull",
+];
 
 // Small modal shown when the user hits Esc on the tab bar. Owns its own
 // cursor so nav keys can drive it independently of the pane focus underneath.
@@ -1369,6 +1378,9 @@ impl App {
                         }
                         RepoActionItem::VsCode => {
                             claude::open_in_vscode(&path);
+                        }
+                        RepoActionItem::Reveal => {
+                            claude::reveal_in_file_manager(&path);
                         }
                         RepoActionItem::Inspect => {
                             // Graph + stats load lazily via ensure_graph_loaded
