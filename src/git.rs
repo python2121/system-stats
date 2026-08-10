@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -84,13 +85,15 @@ pub struct BranchInfo {
     pub last_message: String,
 }
 
-// Owns the scanner thread. The UI holds one and reads new trees from
+// Owns the scanner threads. The UI holds one and reads new trees from
 // `tree_rx`; changing the watched directory is a two-step message:
-// swap the Mutex-guarded path, then poke the wake channel so the thread
-// stops mid-sleep and rescans immediately.
+// swap the Mutex-guarded path, then poke the wake channels so the threads
+// stop mid-sleep and refresh immediately.
 pub struct Scanner {
     tree_rx: Receiver<GitTree>,
     wake_tx: Sender<()>,
+    fetch_wake_tx: Sender<()>,
+    fetching: Arc<AtomicBool>,
     root: Arc<Mutex<PathBuf>>,
 }
 
@@ -99,19 +102,37 @@ impl Scanner {
         self.tree_rx.try_recv()
     }
 
-    // Switch the watched directory and kick off a rescan right now instead
+    // True while the fetch thread is talking to the network. The UI shows a
+    // marker so a manual refresh doesn't look like a no-op during the
+    // seconds between the local scan landing and the fetch finishing.
+    pub fn is_fetching(&self) -> bool {
+        self.fetching.load(Ordering::Relaxed)
+    }
+
+    // Switch the watched directory and kick off a refresh right now instead
     // of waiting up to SCAN_INTERVAL for the next tick.
     pub fn set_root(&self, new_root: PathBuf) {
         if let Ok(mut guard) = self.root.lock() {
             *guard = new_root;
         }
-        // Ignore SendError — a full/disconnected channel just means the
-        // thread is exiting; either way the settings write already happened.
-        let _ = self.wake_tx.send(());
+        self.refresh();
     }
 
-    // Kick off a rescan of the current root right now — used after a pull
-    // completes so ahead/behind counts update without waiting for the tick.
+    // Kick off a refresh of the current root right now — used by the manual
+    // 'r' binding and after a pull completes, so ahead/behind counts update
+    // without waiting for the tick.
+    //
+    // Pokes both threads: the scan lands local state within milliseconds,
+    // and the fetch updates remote-tracking refs a few seconds later, then
+    // pokes the scan thread again so the fresh counts render. Ignore
+    // SendError — a disconnected channel just means that thread is exiting.
+    pub fn refresh(&self) {
+        let _ = self.wake_tx.send(());
+        let _ = self.fetch_wake_tx.send(());
+    }
+
+    // Local-only refresh: re-reads working trees and refs already on disk
+    // without hitting the network.
     pub fn rescan(&self) {
         let _ = self.wake_tx.send(());
     }
@@ -120,20 +141,33 @@ impl Scanner {
 pub fn spawn_scanner(initial_root: PathBuf) -> Scanner {
     let (tree_tx, tree_rx) = mpsc::channel();
     let (wake_tx, wake_rx) = mpsc::channel();
+    let (fetch_wake_tx, fetch_wake_rx) = mpsc::channel();
     let root = Arc::new(Mutex::new(initial_root));
     let thread_root = Arc::clone(&root);
+    let fetching = Arc::new(AtomicBool::new(false));
 
     // Fetch thread: refreshes remote-tracking refs (origin/main etc.) so
     // ahead/behind counts reflect the server, not just the last manual pull.
-    // Separate from the scan thread so a slow network fetch never delays the
-    // 30-second scan cadence.
+    // Separate from the scan thread so a slow network fetch — serial across
+    // every repo under the root, which can run to tens of seconds — never
+    // delays the 30-second scan cadence or a manual rescan.
     let fetch_root = Arc::clone(&root);
     let fetch_wake = wake_tx.clone();
+    let thread_fetching = Arc::clone(&fetching);
     thread::spawn(move || {
         loop {
             let current = fetch_root.lock().ok().map(|g| g.clone());
             if let Some(root) = current {
+                thread_fetching.store(true, Ordering::Relaxed);
                 fetch_repos(&root);
+                // Drop wakes that arrived mid-fetch: the fetch that just ran
+                // was concurrent with them, so re-fetching immediately would
+                // only hammer the network. Drained *before* clearing the
+                // flag, so any wake sent once `is_fetching()` reads false is
+                // guaranteed to survive to the recv below and fetch — no
+                // window where a refresh request vanishes silently.
+                while fetch_wake_rx.try_recv().is_ok() {}
+                thread_fetching.store(false, Ordering::Relaxed);
             }
             // Poke the scanner so fresh ahead/behind counts show up now
             // instead of at the next scan tick. A send error means the
@@ -141,7 +175,14 @@ pub fn spawn_scanner(initial_root: PathBuf) -> Scanner {
             if fetch_wake.send(()).is_err() {
                 return;
             }
-            thread::sleep(FETCH_INTERVAL);
+            match fetch_wake_rx.recv_timeout(FETCH_INTERVAL) {
+                Ok(()) => {
+                    // Collapse a burst of refresh requests into one fetch.
+                    while fetch_wake_rx.try_recv().is_ok() {}
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
         }
     });
 
@@ -167,7 +208,7 @@ pub fn spawn_scanner(initial_root: PathBuf) -> Scanner {
             }
         }
     });
-    Scanner { tree_rx, wake_tx, root }
+    Scanner { tree_rx, wake_tx, fetch_wake_tx, fetching, root }
 }
 
 fn scan(root: &Path) -> Option<GitTree> {

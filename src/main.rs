@@ -1681,16 +1681,21 @@ impl App {
             self.switch_tab(delta);
             return;
         }
-        // On the git status tab, 'r' forces an immediate rescan no matter
+        // On the git status tab, 'r' forces an immediate refresh no matter
         // which pane holds focus (activity list, graph, or full-screen
         // inspect) — checked before the inspect handler, which otherwise
         // swallows every unbound key. Skip when a modifier is held so
         // Ctrl-C and friends still reach the shared handler.
+        //
+        // Full refresh, not just a local rescan: ahead/behind against the
+        // remote is the count most likely to be stale, and a "refresh" that
+        // can't update it is a surprise. The local scan still lands
+        // immediately; the fetch follows on its own thread.
         if self.selected_tab == Tab::GitStatus
             && key.code == KeyCode::Char('r')
             && key.modifiers.is_empty()
         {
-            self.scanner.rescan();
+            self.scanner.refresh();
             return;
         }
         // The full-screen inspect view swallows everything except quit
@@ -2679,8 +2684,15 @@ fn draw_right_pane(f: &mut Frame, app: &App, area: Rect) {
             // Round to 5-second increments so the title doesn't flicker every tick.
             let rounded = (tree.scanned_at.elapsed().as_secs() / 5) * 5;
             let hint = if focused { " (↑/↓ select) " } else { " " };
+            // A fetch runs for seconds after 'r'; without this the keypress
+            // reads as a no-op until the ahead/behind counts quietly change.
+            let fetching = if app.scanner.is_fetching() {
+                " · fetching…"
+            } else {
+                ""
+            };
             let title = format!(
-                " Git activity — {} repos in {}  (scanned {}s ago){hint}",
+                " Git activity — {} repos in {}  (scanned {}s ago{fetching}){hint}",
                 tree.total_repos, tree.root_display, rounded,
             );
             let (lines, extents) =
