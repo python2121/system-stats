@@ -360,14 +360,16 @@ fn claude_dir() -> Option<PathBuf> {
 // left at a plain interactive shell; when Some it's typed into the shell
 // and run after the `cd`, leaving the shell behind when it exits. The
 // string must already be shell-ready (quoted as needed) — it's dropped in
-// verbatim. Fire-and-forget: the launcher process is spawned detached and
-// failures are silent — the new window (or its absence) is its own feedback.
+// verbatim. The launcher process is spawned detached; the return value
+// says only that it started, not that a window appeared, so callers use
+// it to distinguish "nothing to launch with" from "go look at your
+// desktop".
 #[cfg(target_os = "macos")]
 pub fn open_in_terminal(
     terminal: config::TerminalApp,
     dir: &Path,
     command: Option<&str>,
-) {
+) -> bool {
     let dir = dir.display().to_string();
     // iTerm/Terminal run a single line in a fresh shell: cd first, then the
     // optional command joined with `&&` so it only runs if the cd succeeds.
@@ -437,42 +439,80 @@ pub fn open_in_terminal(
         }
     };
 
-    if let Ok(mut child) = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+    match cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
         // Reap the launcher on a background thread so it doesn't linger
         // as a zombie for the app's lifetime.
-        thread::spawn(move || {
-            let _ = child.wait();
-        });
+        Ok(mut child) => {
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+            true
+        }
+        Err(_) => false,
     }
 }
 
-// Linux (and other non-mac): Ghostty ships CLI equivalents of everything
-// the AppleScript path uses — `--working-directory` for the cd, and
-// `--input` (since 1.2) which types the command into the shell the same
-// way `initial input` does on macOS, leaving an interactive shell behind
-// when it exits. Each launch is its own Ghostty process rather than a
-// window in the running instance: plain `ghostty` doesn't join a
-// single-instance app unless activated over D-Bus, and a fresh process
-// also works inside containers (distrobox) where the host session bus
-// may be out of reach. The other TerminalApp variants are macOS-only
-// apps — they can't be detected here, and the undetected-terminal
-// fallback maps to one of them, so they stay silent no-ops until a
-// generic Linux launcher exists.
+// Emulators to try on Linux, in order, when the Ghostty launcher below
+// isn't available. `TerminalApp` can't name any of them — TERM_PROGRAM is
+// a macOS convention that only Ghostty honours here — so rather than
+// detect, we try each in turn and take the first that spawns, the same
+// shape as reveal_in_file_manager. The leading args are each one's "run
+// this command" flag, the only part that varies once the working
+// directory is handled by the script itself. Ghostty leads the list for
+// the case where it's installed but isn't the terminal we're running in.
 #[cfg(not(target_os = "macos"))]
-pub fn open_in_terminal(
-    terminal: config::TerminalApp,
-    dir: &Path,
-    command: Option<&str>,
-) {
-    if terminal != config::TerminalApp::Ghostty {
-        return;
+const TERMINALS: [(&str, &[&str]); 9] = [
+    ("ghostty", &["-e"]),
+    ("konsole", &["-e"]),
+    ("gnome-terminal", &["--"]),
+    ("kitty", &[]),
+    ("wezterm", &["start", "--"]),
+    ("alacritty", &["-e"]),
+    ("foot", &[]),
+    ("xfce4-terminal", &["-x"]),
+    ("xterm", &["-e"]),
+];
+
+// The shell the generic launchers hand the script to. $SHELL is normally
+// an absolute path but can arrive as a bare name (or not at all), and
+// only a path is safe to exec — anything else falls back to /bin/sh.
+#[cfg(not(target_os = "macos"))]
+fn login_shell() -> String {
+    match std::env::var("SHELL") {
+        Ok(s) if s.starts_with('/') => s,
+        _ => "/bin/sh".to_string(),
     }
-    let mut cmd = Command::new("ghostty");
-    cmd.arg(format!("--working-directory={}", dir.display()));
-    if let Some(c) = command {
-        // The value after `raw:` uses Zig string-literal escapes; the
-        // trailing `\n` presses Enter.
-        cmd.arg(format!("--input=raw:{}\\n", ghostty_input_escape(c)));
+}
+
+// What the generic launchers run: cd into the project, run the command if
+// there is one, then hand the window to an interactive shell so it stays
+// open — the same end state as the macOS `do script` path. A command that
+// ends in `exit` (the custom-action close-on-success form) ends this shell
+// before the `exec` is reached, so the window closes as intended.
+#[cfg(not(target_os = "macos"))]
+fn shell_script(dir: &Path, command: Option<&str>) -> String {
+    let cd = format!("cd {} || exit 1", shell_quote(&dir.display().to_string()));
+    let shell = shell_quote(&login_shell());
+    match command {
+        Some(c) => format!("{cd}; {c}; exec {shell} -i"),
+        None => format!("{cd}; exec {shell} -i"),
+    }
+}
+
+// Spawn a window launcher and stop caring about it. `dir` is also the
+// child's working directory so emulators that ignore the script's `cd`
+// (gnome-terminal hands off to a server) still land in the right place;
+// a directory that has since been deleted would fail every candidate, so
+// it's only set when it's really there.
+#[cfg(not(target_os = "macos"))]
+fn spawn_detached(mut cmd: Command, dir: &Path) -> bool {
+    if dir.is_dir() {
+        cmd.current_dir(dir);
     }
     // A new process group keeps the long-lived window process out of the
     // TUI's group so terminal signals aimed at the app can't reach it.
@@ -480,14 +520,86 @@ pub fn open_in_terminal(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-
-    if let Ok(mut child) = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+    match cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
         // Reap the launcher on a background thread so it doesn't linger
         // as a zombie for the app's lifetime.
-        thread::spawn(move || {
-            let _ = child.wait();
-        });
+        Ok(mut child) => {
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+            true
+        }
+        Err(_) => false,
     }
+}
+
+// Ghostty ships CLI equivalents of everything the AppleScript path uses —
+// `--working-directory` for the cd, and `--input` (since 1.2) which types
+// the command into the shell the same way `initial input` does on macOS,
+// leaving an interactive shell behind when it exits. Preferred over the
+// generic `-e` form because it reproduces the macOS behaviour exactly.
+// Each launch is its own Ghostty process rather than a window in the
+// running instance: plain `ghostty` doesn't join a single-instance app
+// unless activated over D-Bus, and a fresh process also works inside
+// containers (distrobox) where the host session bus may be out of reach.
+#[cfg(not(target_os = "macos"))]
+fn spawn_ghostty(dir: &Path, command: Option<&str>) -> bool {
+    let mut cmd = Command::new("ghostty");
+    cmd.arg(format!("--working-directory={}", dir.display()));
+    if let Some(c) = command {
+        // The value after `raw:` uses Zig string-literal escapes; the
+        // trailing `\n` presses Enter.
+        cmd.arg(format!("--input=raw:{}\\n", ghostty_input_escape(c)));
+    }
+    spawn_detached(cmd, dir)
+}
+
+// Linux (and other non-mac). `terminal` is only a hint about which
+// launcher to try first: the two non-Ghostty variants are macOS-only apps
+// and the undetected-terminal fallback maps to one of them, so treating a
+// non-match as "give up" would leave Enter doing nothing for everyone
+// under tmux, an editor terminal, or any emulator that doesn't set
+// TERM_PROGRAM. Instead we work down a list until something spawns.
+//
+// A spawn only fails when the binary isn't there (ENOENT), not when it
+// launches and then can't reach a display — so, as with
+// reveal_in_file_manager, `true` means "a launcher started", and the
+// window (or its absence) is the rest of the feedback.
+#[cfg(not(target_os = "macos"))]
+pub fn open_in_terminal(
+    terminal: config::TerminalApp,
+    dir: &Path,
+    command: Option<&str>,
+) -> bool {
+    if terminal == config::TerminalApp::Ghostty && spawn_ghostty(dir, command) {
+        return true;
+    }
+    let shell = login_shell();
+    let script = shell_script(dir, command);
+    // $TERMINAL is the conventional "my preferred emulator" override, and
+    // the only way to reach one this list doesn't name.
+    let preferred = std::env::var("TERMINAL")
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+    let candidates = preferred
+        .as_deref()
+        .map(|bin| (bin, ["-e"].as_slice()))
+        .into_iter()
+        .chain(TERMINALS);
+    for (bin, prefix) in candidates {
+        let mut cmd = Command::new(bin);
+        cmd.args(prefix);
+        cmd.args([shell.as_str(), "-c", script.as_str()]);
+        if spawn_detached(cmd, dir) {
+            return true;
+        }
+    }
+    false
 }
 
 // Open a directory as a folder in VS Code. `code <dir>` is the same CLI on
@@ -611,9 +723,9 @@ pub fn resume_in_terminal(
     terminal: config::TerminalApp,
     project_dir: &Path,
     session_id: &str,
-) {
+) -> bool {
     let command = format!("claude --resume {}", shell_quote(session_id));
-    open_in_terminal(terminal, project_dir, Some(&command));
+    open_in_terminal(terminal, project_dir, Some(&command))
 }
 
 // Single-quote for POSIX shells: '…' with embedded quotes as '\''.
@@ -990,6 +1102,34 @@ mod tests {
             r#"claude --resume 'x\"y'"#,
         );
         assert_eq!(ghostty_input_escape(r"back\slash"), r"back\\slash");
+    }
+
+    // The generic-emulator script has to do three things: land in the
+    // project (quoted, so a space in the path survives), run the command
+    // verbatim, and leave an interactive shell behind.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn shell_script_keeps_a_shell_behind() {
+        let script = shell_script(Path::new("/tmp/my code"), Some("claude --resume 'x'"));
+        assert!(script.starts_with("cd '/tmp/my code' || exit 1; "));
+        assert!(script.contains("claude --resume 'x';"));
+        assert!(script.ends_with(" -i"));
+        assert!(script.contains("; exec "));
+        // No command → straight to the interactive shell.
+        let bare = shell_script(Path::new("/tmp/x"), None);
+        assert!(bare.starts_with("cd '/tmp/x' || exit 1; exec "));
+    }
+
+    // The custom-action close-on-success form appends `&& exit`, which has
+    // to end the script shell before the trailing `exec` gets a chance to
+    // replace it — otherwise the window would never close.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn shell_script_lets_close_on_exit_win() {
+        let script = shell_script(Path::new("/tmp/x"), Some("(make) && exit"));
+        let exit_at = script.find("(make) && exit").expect("command is present");
+        let exec_at = script.find("; exec ").expect("exec is present");
+        assert!(exit_at < exec_at);
     }
 
     #[test]

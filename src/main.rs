@@ -363,6 +363,29 @@ enum PullState {
     Done { repo: String, success: bool, message: String, at: Instant },
 }
 
+// Actions that open a window elsewhere normally need no acknowledgement —
+// the window is the feedback. This is for the cases where no window is
+// coming: a session that's already live, or a machine with no terminal
+// emulator we know how to drive. Shown on the tab bar (so it's visible
+// whichever tab triggered it) and timed out like PullState::Done, so it
+// never needs dismissing.
+struct Notice {
+    message: String,
+    at: Instant,
+}
+
+const NOTICE_TTL: Duration = Duration::from_secs(6);
+
+// Shown when every terminal launcher failed to even start. On Linux that
+// means none of the emulators we know are installed, which $TERMINAL can
+// fix; on macOS it takes an osascript that won't run, which nothing here
+// can advise about.
+#[cfg(not(target_os = "macos"))]
+const NO_TERMINAL_NOTICE: &str =
+    "no terminal emulator found — install one, or point $TERMINAL at it";
+#[cfg(target_os = "macos")]
+const NO_TERMINAL_NOTICE: &str = "couldn't open a terminal window";
+
 struct App {
     scanner: Scanner,
     // Persisted settings (currently just watch_dir). Kept in-memory so that
@@ -384,6 +407,8 @@ struct App {
     git_inspect: Option<String>,
     // In-flight or recently finished `git pull`, surfaced on the repo row.
     git_pull: Option<PullState>,
+    // Transient "that didn't open a window, and here's why" message.
+    notice: Option<Notice>,
     // Scroll offset for the inspect view, clamped against the size cached
     // by the last draw (same pattern as the left graph pane).
     inspect_scroll: u16,
@@ -484,6 +509,7 @@ impl App {
             stats_cache: HashMap::new(),
             git_inspect: None,
             git_pull: None,
+            notice: None,
             inspect_scroll: 0,
             inspect_content_lines: Cell::new(0),
             inspect_inner_height: Cell::new(0),
@@ -668,6 +694,16 @@ impl App {
                 self.git_pull = None;
             }
             _ => {}
+        }
+    }
+
+    fn set_notice(&mut self, message: String) {
+        self.notice = Some(Notice { message, at: Instant::now() });
+    }
+
+    fn expire_notice(&mut self) {
+        if self.notice.as_ref().is_some_and(|n| n.at.elapsed() >= NOTICE_TTL) {
+            self.notice = None;
         }
     }
 
@@ -1127,8 +1163,10 @@ impl App {
     // user's terminal, cd into the project, and `claude --resume` the
     // session. Live sessions are skipped — they're already attached in
     // some terminal, and a second client would interleave into the same
-    // transcript.
-    fn resume_selected_session(&self) {
+    // transcript — but say so, because the detail view auto-selects the
+    // newest session and that's exactly the one likeliest to be live:
+    // without a word, drilling in and pressing Enter looks broken.
+    fn resume_selected_session(&mut self) {
         let (Some(tree), Some(pname), Some(sid)) = (
             &self.claude_tree,
             &self.claude_detail,
@@ -1142,15 +1180,26 @@ impl App {
         let Some(session) = project.sessions.iter().find(|s| s.id == *sid) else {
             return;
         };
-        if session.live.is_some() {
+        if let Some(live) = &session.live {
+            let msg = format!(
+                "already running as {} (pid {}) — switch to its window instead",
+                if live.name.is_empty() { "a live session" } else { &live.name },
+                live.pid,
+            );
+            self.set_notice(msg);
             return;
         }
         // Undetected terminal (tmux, editor-embedded) falls back to
-        // Terminal.app — always present on macOS.
+        // Terminal.app — always present on macOS. On Linux the value only
+        // picks which launcher is tried first; open_in_terminal works
+        // down its own list from there.
         let terminal = self
             .terminal
             .unwrap_or(config::TerminalApp::TerminalApp);
-        claude::resume_in_terminal(terminal, &project.path, &session.id);
+        let (path, id) = (project.path.clone(), session.id.clone());
+        if !claude::resume_in_terminal(terminal, &path, &id) {
+            self.set_notice(NO_TERMINAL_NOTICE.to_string());
+        }
     }
 
     // The Claude tab's own interactions — the same shape as
@@ -1371,10 +1420,14 @@ impl App {
                 if selected < n_builtin {
                     match REPO_ACTION_ITEMS[selected] {
                         RepoActionItem::Terminal => {
-                            claude::open_in_terminal(terminal, &path, None);
+                            if !claude::open_in_terminal(terminal, &path, None) {
+                                self.set_notice(NO_TERMINAL_NOTICE.to_string());
+                            }
                         }
                         RepoActionItem::Claude => {
-                            claude::open_in_terminal(terminal, &path, Some("claude"));
+                            if !claude::open_in_terminal(terminal, &path, Some("claude")) {
+                                self.set_notice(NO_TERMINAL_NOTICE.to_string());
+                            }
                         }
                         RepoActionItem::VsCode => {
                             claude::open_in_vscode(&path);
@@ -1408,7 +1461,9 @@ impl App {
                     } else {
                         cmd.clone()
                     };
-                    claude::open_in_terminal(terminal, &path, Some(&cmd));
+                    if !claude::open_in_terminal(terminal, &path, Some(&cmd)) {
+                        self.set_notice(NO_TERMINAL_NOTICE.to_string());
+                    }
                 } else {
                     // The trailing "Custom…" entry. Leave the menu on the
                     // stack so closing the editor drops back onto it, with
@@ -1810,6 +1865,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     while !app.should_quit {
         app.drain_git_updates();
         app.drain_pull_updates();
+        app.expire_notice();
         app.drain_network_updates();
         app.drain_process_updates();
         app.drain_hardware_updates();
@@ -2139,16 +2195,32 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|s| Line::from(Span::raw(*s)))
         .collect();
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    // Notices ride on the tab bar's top border: it's on screen whichever
+    // tab raised them, and the border is the one place no tab is already
+    // using. Truncated to what's left after the labels so a long message
+    // can't shove them off a narrow terminal.
+    if let Some(notice) = &app.notice {
+        let labels: usize = TAB_LABELS.iter().map(|s| s.chars().count() + 3).sum();
+        let room = (area.width as usize).saturating_sub(labels + 4);
+        if room > 8 {
+            block = block.title_top(
+                Line::from(Span::styled(
+                    format!(" {} ", truncate(&notice.message, room)),
+                    Style::default().fg(Color::Yellow),
+                ))
+                .right_aligned(),
+            );
+        }
+    }
     let tabs = Tabs::new(titles)
         .select(app.selected_tab.index())
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(highlight_style)
         .divider(Span::styled("│", Style::default().fg(Color::DarkGray)))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style),
-        );
+        .block(block);
     f.render_widget(tabs, area);
 }
 
