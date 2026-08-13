@@ -286,5 +286,98 @@ mod tests {
             .map(|a| a.name.as_str())
             .collect();
         assert_eq!(names, ["one", "three"]);
+        assert_eq!(cfg.actions_for(Path::new("/nope")).count(), 0);
+    }
+
+    #[test]
+    fn parse_skips_comments_and_blank_lines() {
+        let cfg = parse("# system-stats config\n\n   \nwatch_dir=/tmp/code\n");
+        assert_eq!(cfg.watch_dir, PathBuf::from("/tmp/code"));
+        assert!(cfg.custom_actions.is_empty());
+    }
+
+    #[test]
+    fn parse_ignores_keys_it_doesnt_know() {
+        // Old binaries must survive a config written by a newer one, and a
+        // retired key (terminal=) must not resurrect as a watch dir.
+        let cfg = parse("terminal=ghostty\nfuture_key=whatever\nwatch_dir=/tmp/code\n");
+        assert_eq!(cfg.watch_dir, PathBuf::from("/tmp/code"));
+    }
+
+    #[test]
+    fn parse_falls_back_to_defaults_for_missing_keys() {
+        // A config with no watch_dir keeps the default rather than blanking it.
+        let cfg = parse("# nothing here\n");
+        assert_eq!(cfg.watch_dir, default_watch_dir());
+    }
+
+    #[test]
+    fn parse_keeps_equals_signs_inside_values() {
+        // split_once means only the first '=' delimits.
+        let cfg = parse("custom_action=/a\tdeploy\tmake deploy ENV=prod K=v\n");
+        assert_eq!(cfg.custom_actions[0].command, "make deploy ENV=prod K=v");
+    }
+
+    #[test]
+    fn serialize_flattens_tabs_that_would_corrupt_a_line() {
+        // Tabs are the field separator, so a value carrying one (or a
+        // newline) would silently split the line on reload.
+        let cfg = Config {
+            watch_dir: PathBuf::from("/tmp"),
+            custom_actions: vec![CustomAction {
+                repo_path: PathBuf::from("/a"),
+                name: "we\tird".to_string(),
+                command: "echo a\nb".to_string(),
+                close_on_exit: false,
+            }],
+        };
+        let parsed = parse(&cfg.serialize());
+        assert_eq!(parsed.custom_actions.len(), 1);
+        assert_eq!(parsed.custom_actions[0].name, "we ird");
+        assert_eq!(parsed.custom_actions[0].command, "echo a b");
+    }
+
+    #[test]
+    fn display_path_shortens_paths_under_home() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+        assert_eq!(display_path(&home.join("Documents/code")), "~/Documents/code");
+        assert_eq!(display_path(&home), "~");
+        // Outside HOME it's shown verbatim — including a path that merely
+        // starts with the same characters.
+        assert_eq!(display_path(Path::new("/opt/tools")), "/opt/tools");
+    }
+
+    #[test]
+    fn expand_tilde_is_the_inverse_of_display_path() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/Documents/code"), home.join("Documents/code"));
+        // Only a leading "~/" counts; anything else is literal.
+        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+        assert_eq!(expand_tilde("rel/path"), PathBuf::from("rel/path"));
+        assert_eq!(expand_tilde("~user/path"), PathBuf::from("~user/path"));
+        assert_eq!(expand_tilde(""), PathBuf::from(""));
+    }
+
+    #[test]
+    fn config_path_prefers_xdg_when_set() {
+        // Read-only check of the two branches' shapes — the env is left
+        // alone so parallel tests don't race on it.
+        let path = config_path().expect("HOME or XDG_CONFIG_HOME is set");
+        assert!(path.ends_with(PathBuf::from(APP_DIR).join(CONFIG_FILENAME)));
+        match std::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty()) {
+            Some(xdg) => assert!(path.starts_with(PathBuf::from(xdg))),
+            None => {
+                let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+                assert_eq!(path, home.join(".config").join(APP_DIR).join(CONFIG_FILENAME));
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_labels_are_human_readable() {
+        assert_eq!(TerminalApp::Ghostty.label(), "Ghostty");
+        assert_eq!(TerminalApp::Iterm2.label(), "iTerm2");
+        assert_eq!(TerminalApp::TerminalApp.label(), "Terminal.app");
     }
 }

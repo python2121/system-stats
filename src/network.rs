@@ -804,4 +804,184 @@ tcp4 192.168.1.142:52541<->142.250.72.14:443,200,20,
         assert_eq!(app.hosts[&host].bytes_in, 300);
         assert_eq!(app.hosts[&host].conn_count, 2);
     }
+
+    // ---------- NetworkState smoothing ----------
+
+    // (app name, bytes in, bytes out, [(remote ip, bytes in)]).
+    type AppFixture<'a> = (&'a str, u64, u64, Vec<(&'a str, u64)>);
+
+    fn net_sample(apps: Vec<AppFixture<'_>>) -> NetSample {
+        let mut total_in = 0;
+        let mut total_out = 0;
+        let mut map = HashMap::new();
+        for (name, bytes_in, bytes_out, hosts) in apps {
+            total_in += bytes_in;
+            total_out += bytes_out;
+            let hosts: HashMap<IpAddr, HostDelta> = hosts
+                .into_iter()
+                .map(|(ip, bytes)| {
+                    (
+                        ip.parse().unwrap(),
+                        HostDelta { bytes_in: bytes, bytes_out: 0, conn_count: 1 },
+                    )
+                })
+                .collect();
+            let conn_count = hosts.len() as u32;
+            map.insert(
+                name.to_string(),
+                AppDelta { bytes_in, bytes_out, conn_count, hosts },
+            );
+        }
+        NetSample { interval: SAMPLE_INTERVAL, apps: map, total_in, total_out }
+    }
+
+    #[test]
+    fn rates_are_bytes_per_second_not_bytes_per_sample() {
+        let mut state = NetworkState::new();
+        // 2000 bytes over the 1s sample interval.
+        state.apply_sample(net_sample(vec![("app", 2_000, 0, vec![])]));
+        assert_eq!(
+            state.history_in.back(),
+            Some(&(2_000 / SAMPLE_INTERVAL.as_secs() as u32))
+        );
+        assert_eq!(state.apps["app"].history.back(), state.history_in.back());
+    }
+
+    #[test]
+    fn an_app_with_no_traffic_this_tick_decays_instead_of_vanishing() {
+        // nettop only reports apps with connections, so a missing app is
+        // "quiet", not "gone" — its sparkline must stay time-aligned.
+        let mut state = NetworkState::new();
+        state.apply_sample(net_sample(vec![("app", 10_000, 0, vec![])]));
+        let busy_ema = state.apps["app"].ema_bps_in;
+        state.apply_sample(net_sample(vec![]));
+        let stat = &state.apps["app"];
+        assert!(stat.ema_bps_in < busy_ema && stat.ema_bps_in > 0.0);
+        assert_eq!(stat.conn_count, 0);
+        // A zero sample was pushed, so the history advanced by one.
+        assert_eq!(stat.history.iter().copied().collect::<Vec<_>>().len(), 2);
+        assert_eq!(stat.history.back(), Some(&0));
+    }
+
+    #[test]
+    fn apps_sort_by_window_peak_then_rate_then_name() {
+        let mut state = NetworkState::new();
+        state.apply_sample(net_sample(vec![
+            ("spiky", 100_000, 0, vec![]),
+            ("steady", 1_000, 0, vec![]),
+        ]));
+        // Spiky goes quiet, but its peak keeps it first for the window.
+        state.apply_sample(net_sample(vec![("steady", 1_000, 0, vec![])]));
+        let order: Vec<&str> =
+            state.sorted_apps().iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(order, vec!["spiky", "steady"]);
+
+        // Two apps with identical (zero) traffic fall back to name order.
+        let mut state = NetworkState::new();
+        state.apply_sample(net_sample(vec![("zed", 0, 0, vec![]), ("apl", 0, 0, vec![])]));
+        let order: Vec<&str> =
+            state.sorted_apps().iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(order, vec!["apl", "zed"]);
+    }
+
+    #[test]
+    fn top_hosts_ranks_by_smoothed_rate_and_truncates() {
+        let mut state = NetworkState::new();
+        state.apply_sample(net_sample(vec![(
+            "app",
+            6_000,
+            0,
+            vec![("1.1.1.1", 1_000), ("2.2.2.2", 3_000), ("3.3.3.3", 2_000)],
+        )]));
+        let stat = &state.apps["app"];
+        let ips: Vec<String> =
+            stat.top_hosts(2).iter().map(|(ip, _)| ip.to_string()).collect();
+        assert_eq!(ips, vec!["2.2.2.2", "3.3.3.3"]);
+        assert_eq!(stat.top_hosts(99).len(), 3);
+        assert!(stat.top_hosts(0).is_empty());
+    }
+
+    #[test]
+    fn a_host_the_sample_skipped_decays_but_stays_listed() {
+        let mut state = NetworkState::new();
+        let ip: IpAddr = "1.1.1.1".parse().unwrap();
+        state.apply_sample(net_sample(vec![("app", 4_000, 0, vec![("1.1.1.1", 4_000)])]));
+        let busy = state.apps["app"].hosts[&ip].ema_bps_in;
+        state.apply_sample(net_sample(vec![("app", 0, 0, vec![("2.2.2.2", 0)])]));
+        let host = &state.apps["app"].hosts[&ip];
+        assert!(host.ema_bps_in < busy && host.ema_bps_in > 0.0);
+        assert_eq!(host.conn_count, 0);
+    }
+
+    #[test]
+    fn totals_smooth_toward_the_sampled_rate() {
+        let mut state = NetworkState::new();
+        for _ in 0..50 {
+            state.apply_sample(net_sample(vec![("app", 1_000, 500, vec![])]));
+        }
+        let per_sec = |b: u64| b as f64 / SAMPLE_INTERVAL.as_secs_f64();
+        assert!((state.ema_total_in - per_sec(1_000)).abs() < 1.0);
+        assert!((state.ema_total_out - per_sec(500)).abs() < 1.0);
+        assert!(state.last_sample_at.is_some());
+    }
+
+    #[test]
+    fn hostname_lookup_misses_until_the_resolver_answers() {
+        let state = NetworkState::new();
+        assert_eq!(state.hostname_for(&"192.0.2.1".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn histories_evict_the_oldest_sample_at_the_cap() {
+        let mut h = VecDeque::new();
+        for i in 0..4 {
+            push_history(&mut h, i, 3);
+        }
+        assert_eq!(h.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    // ---------- row parsing ----------
+
+    #[test]
+    fn process_rows_keep_the_pid_bearing_label() {
+        // The delta tracker keys connections by the raw label, so two pids
+        // of one binary can't collide.
+        match parse_row("Google Chrome Helper (GPU).412,0,0,") {
+            Some(Row::Process { name, raw }) => {
+                assert_eq!(name, "Google Chrome Helper (GPU)");
+                assert_eq!(raw, "Google Chrome Helper (GPU).412");
+            }
+            _ => panic!("expected a process row"),
+        }
+    }
+
+    #[test]
+    fn connection_rows_with_blank_counters_read_as_zero() {
+        // nettop prints empty fields for a connection with no traffic yet.
+        match parse_row("tcp4 192.168.1.142:52541<->151.101.1.91:443,,,") {
+            Some(Row::Connection { bytes_in, bytes_out, remote_ip, .. }) => {
+                assert_eq!((bytes_in, bytes_out), (0, 0));
+                assert_eq!(remote_ip.to_string(), "151.101.1.91");
+            }
+            _ => panic!("expected a connection row"),
+        }
+    }
+
+    #[test]
+    fn malformed_rows_are_skipped() {
+        assert!(parse_row("").is_none());
+        assert!(parse_row(",1,2,").is_none());
+        // Too few fields to be either kind of row.
+        assert!(parse_row("firefox.935").is_none());
+    }
+
+    #[test]
+    fn canonical_app_leaves_ordinary_names_alone() {
+        assert_eq!(canonical_app("sshd"), "sshd");
+        assert_eq!(canonical_app(""), "");
+        // A version-looking name needs at least two all-digit parts.
+        assert_eq!(canonical_app("2"), "2");
+        assert_eq!(canonical_app("v2.1.198"), "v2.1.198");
+        assert_eq!(canonical_app("node.js"), "node.js");
+    }
 }

@@ -379,4 +379,88 @@ mod tests {
             state.sorted_apps().iter().map(|a| a.name.as_str()).collect();
         assert_eq!(order, vec!["spiky", "steady", "hog"]);
     }
+
+    #[test]
+    fn equal_apps_sort_by_name_so_rows_dont_jitter() {
+        // Without the name tie-break, HashMap iteration order would shuffle
+        // identical rows every frame.
+        let mut state = ProcessState::new();
+        state.apply_sample(sample(vec![("zed", 0.0, 1 << 20), ("apl", 0.0, 1 << 20)]));
+        let order: Vec<&str> =
+            state.sorted_apps().iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(order, vec!["apl", "zed"]);
+    }
+
+    #[test]
+    fn member_processes_are_listed_busiest_first() {
+        let mut state = ProcessState::new();
+        let procs = vec![
+            ProcInfo { pid: 3, name: "helper".into(), cpu: 1.0, mem: 100 },
+            ProcInfo { pid: 1, name: "main".into(), cpu: 40.0, mem: 100 },
+            ProcInfo { pid: 2, name: "helper".into(), cpu: 1.0, mem: 900 },
+        ];
+        let mut apps = HashMap::new();
+        apps.insert("app".to_string(), AppDelta { cpu: 42.0, mem: 1_100, procs });
+        state.apply_sample(ProcSample {
+            interval: SAMPLE_INTERVAL,
+            cpu_total: 10.0,
+            core_count: 8,
+            load_avg: 1.0,
+            mem_used: 0,
+            mem_total: 0,
+            apps,
+        });
+        // CPU first, then memory, then pid — deterministic all the way down.
+        let pids: Vec<u32> = state.apps["app"].procs.iter().map(|p| p.pid).collect();
+        assert_eq!(pids, vec![1, 2, 3]);
+        assert_eq!(state.total_proc_count(), 3);
+    }
+
+    #[test]
+    fn memory_tracks_the_latest_sample_without_smoothing() {
+        // Memory doesn't flicker the way CPU does, so it's reported raw.
+        let mut state = ProcessState::new();
+        state.apply_sample(sample(vec![("app", 1.0, 1 << 30)]));
+        state.apply_sample(sample(vec![("app", 1.0, 1 << 20)]));
+        assert_eq!(state.apps["app"].mem, 1 << 20);
+        // The MiB history follows it.
+        assert_eq!(
+            state.apps["app"].history_mem.iter().copied().collect::<Vec<_>>(),
+            vec![1024, 1]
+        );
+    }
+
+    #[test]
+    fn window_peak_decays_once_the_spike_falls_off_the_history() {
+        let mut state = ProcessState::new();
+        state.apply_sample(sample(vec![("app", 90.0, 0)]));
+        assert_eq!(state.apps["app"].peak_cpu_deci(), 900);
+        // Fill the window with idle samples; the old spike ages out.
+        for _ in 0..HISTORY_LEN {
+            state.apply_sample(sample(vec![("app", 0.0, 0)]));
+        }
+        assert_eq!(state.apps["app"].peak_cpu_deci(), 0);
+        assert_eq!(state.apps["app"].history.len(), HISTORY_LEN);
+    }
+
+    #[test]
+    fn whole_system_stats_follow_the_sample() {
+        let mut state = ProcessState::new();
+        state.apply_sample(sample(vec![("app", 1.0, 0)]));
+        assert_eq!(state.core_count, 8);
+        assert_eq!(state.mem_total, 16 * 1024 * 1024 * 1024);
+        assert_eq!(state.history_cpu.back(), Some(&100));
+        // 8 GiB in MiB.
+        assert_eq!(state.history_mem.back(), Some(&8_192));
+        assert!(state.last_sample_at.is_some());
+    }
+
+    #[test]
+    fn histories_evict_the_oldest_sample_at_the_cap() {
+        let mut h = VecDeque::new();
+        for i in 0..4 {
+            push_history(&mut h, i, 3);
+        }
+        assert_eq!(h.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
 }

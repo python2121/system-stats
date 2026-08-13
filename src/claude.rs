@@ -1301,4 +1301,149 @@ mod tests {
         let p = parse_transcript_text(text);
         assert_eq!(p.title, "array-form prompt");
     }
+
+    // ---------- text cleanup ----------
+
+    #[test]
+    fn whitespace_collapses_to_single_spaces() {
+        assert_eq!(collapse_ws("  fix   the\n\tparser  "), "fix the parser");
+        assert_eq!(collapse_ws(""), "");
+        assert_eq!(collapse_ws("   "), "");
+    }
+
+    #[test]
+    fn long_titles_are_cut_to_a_fixed_width() {
+        let long = "x".repeat(TITLE_MAX_CHARS + 50);
+        let out = collapse_ws(&long);
+        assert_eq!(out.chars().count(), TITLE_MAX_CHARS);
+        assert!(out.ends_with('…'));
+        // Exactly at the limit is left intact.
+        let exact = "y".repeat(TITLE_MAX_CHARS);
+        assert_eq!(collapse_ws(&exact), exact);
+    }
+
+    #[test]
+    fn long_titles_cut_on_char_boundaries() {
+        // Byte-slicing a multi-byte char would panic.
+        let long = "é".repeat(TITLE_MAX_CHARS + 10);
+        assert_eq!(collapse_ws(&long).chars().count(), TITLE_MAX_CHARS);
+    }
+
+    #[test]
+    fn clean_title_rejects_injected_system_text() {
+        // Slash commands, bracketed notices and resume preambles are not
+        // things the user typed as a prompt.
+        assert_eq!(clean_title("<command-name>/clear</command-name>"), "");
+        assert_eq!(clean_title("[Request interrupted by user]"), "");
+        assert_eq!(clean_title("Caveat: The messages below…"), "");
+        assert_eq!(clean_title("This session is being continued from…"), "");
+        // A real prompt survives, whitespace-collapsed.
+        assert_eq!(clean_title("  add   tests "), "add tests");
+    }
+
+    // ---------- timestamps ----------
+
+    #[test]
+    fn iso_parse_rejects_malformed_layouts() {
+        assert!(parse_iso_secs("2026-07-06T05:58:14").is_some());
+        // Wrong separators, short strings, impossible month/day.
+        assert!(parse_iso_secs("2026/07/06T05:58:14").is_none());
+        assert!(parse_iso_secs("2026-07-06 05:58:14").is_none());
+        assert!(parse_iso_secs("2026-07-06T05:58").is_none());
+        assert!(parse_iso_secs("").is_none());
+        assert!(parse_iso_secs("2026-13-06T05:58:14").is_none());
+        assert!(parse_iso_secs("2026-07-00T05:58:14").is_none());
+        // Pre-epoch dates can't be u64 seconds.
+        assert!(parse_iso_secs("1969-12-31T23:59:59").is_none());
+    }
+
+    #[test]
+    fn civil_day_math_round_trips_known_dates() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(1970, 1, 2), 1);
+        assert_eq!(days_from_civil(2000, 2, 29), 11_016);
+        assert_eq!(days_from_civil(2024, 1, 1), 19_723);
+        assert_eq!(days_from_civil(1969, 12, 31), -1);
+    }
+
+    #[test]
+    fn timestamps_are_pulled_out_of_a_whole_record() {
+        let line = r#"{"type":"user","timestamp":"2026-07-06T05:58:14.438Z","x":1}"#;
+        assert_eq!(extract_timestamp(line), parse_iso_secs("2026-07-06T05:58:14"));
+        assert!(extract_timestamp(r#"{"type":"user"}"#).is_none());
+        // Truncated value — the 19-char slice runs off the end.
+        assert!(extract_timestamp(r#"{"timestamp":"2026-07"}"#).is_none());
+    }
+
+    // ---------- record field extraction ----------
+
+    #[test]
+    fn message_ids_only_match_the_msg_prefixed_field() {
+        let line = r#"{"message":{"id":"msg_01ABC","role":"assistant"}}"#;
+        assert_eq!(message_id(line), Some("msg_01ABC".to_string()));
+        // A tool_use id (or any other id) is not a message id.
+        assert_eq!(message_id(r#"{"id":"toolu_01XYZ"}"#), None);
+        assert_eq!(message_id("{}"), None);
+    }
+
+    #[test]
+    fn user_text_reads_both_content_shapes() {
+        assert_eq!(
+            extract_user_text(r#"{"message":{"content":"hello"}}"#),
+            Some("hello".to_string())
+        );
+        assert_eq!(
+            extract_user_text(r#"{"content":[{"type":"text","text":"block"}]}"#),
+            Some("block".to_string())
+        );
+        assert_eq!(extract_user_text(r#"{"message":{}}"#), None);
+    }
+
+    #[test]
+    fn json_str_stops_at_the_closing_quote_and_bounds_its_output() {
+        assert_eq!(json_str(r#"{"k":"v"}"#, "k"), Some("v".to_string()));
+        // An escaped quote inside the value must not end it.
+        assert_eq!(json_str(r#"{"k":"a\"b"}"#, "k"), Some("a\"b".to_string()));
+        // Escaped newlines/tabs become spaces so titles stay one line.
+        assert_eq!(json_str(r#"{"k":"a\nb\tc"}"#, "k"), Some("a b c".to_string()));
+        // \u escapes decode to their character.
+        assert_eq!(json_str(r#"{"k":"café"}"#, "k"), Some("café".to_string()));
+        assert_eq!(json_str(r#"{"other":"v"}"#, "k"), None);
+        // Unterminated values are refused rather than returned half-read.
+        assert_eq!(json_str(r#"{"k":"never closed"#, "k"), None);
+        // A pathological value can't balloon memory.
+        let huge = format!(r#"{{"k":"{}"}}"#, "x".repeat(5_000));
+        assert!(json_str(&huge, "k").unwrap().len() <= 601);
+    }
+
+    #[test]
+    fn json_u64_ignores_non_numeric_values() {
+        assert_eq!(json_u64(r#"{"pid": 4321}"#, "pid"), Some(4321));
+        assert_eq!(json_u64(r#"{"pid":"4321"}"#, "pid"), None);
+        assert_eq!(json_u64(r#"{"pid":}"#, "pid"), None);
+        assert_eq!(json_u64("{}", "pid"), None);
+    }
+
+    // ---------- pricing ----------
+
+    #[test]
+    fn unknown_models_price_at_the_opus_tier() {
+        // Zero would silently under-report a session's cost.
+        assert_eq!(model_rates("some-future-model"), (5.0, 25.0));
+        assert_eq!(model_rates(""), (5.0, 25.0));
+    }
+
+    #[test]
+    fn cache_tokens_bill_at_their_own_multiples_of_input() {
+        let u = MsgUsage { input: 0, output: 0, cache_write: 1_000_000, cache_read: 0 };
+        // Writes are 1.25 × input rate; sonnet input is $3/M.
+        assert!((usage_cost("claude-sonnet-5", &u) - 3.75).abs() < 1e-9);
+        let u = MsgUsage { input: 0, output: 0, cache_write: 0, cache_read: 1_000_000 };
+        // Reads are 0.10 × input rate.
+        assert!((usage_cost("claude-sonnet-5", &u) - 0.30).abs() < 1e-9);
+        let u = MsgUsage { input: 1_000_000, output: 1_000_000, cache_write: 0, cache_read: 0 };
+        assert!((usage_cost("claude-sonnet-5", &u) - 18.0).abs() < 1e-9);
+        // No usage, no cost.
+        assert_eq!(usage_cost("claude-opus-5", &MsgUsage::default()), 0.0);
+    }
 }

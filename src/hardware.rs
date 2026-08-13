@@ -419,6 +419,28 @@ fn push_history_signed(h: &mut VecDeque<i32>, v: i32, cap: usize) {
 mod tests {
     use super::*;
 
+    fn empty_sample() -> HwSample {
+        HwSample {
+            interval: SAMPLE_INTERVAL,
+            battery: None,
+            system: None,
+            disk: None,
+            volumes: Vec::new(),
+            unmounted: None,
+        }
+    }
+
+    fn counters(read_bytes: u64, write_bytes: u64) -> DiskCounters {
+        DiskCounters {
+            read_bytes,
+            write_bytes,
+            read_ops: 0,
+            write_ops: 0,
+            read_time_ns: 0,
+            write_time_ns: 0,
+        }
+    }
+
     #[test]
     fn disk_rates_come_from_deltas_and_first_sample_is_baseline() {
         let mut state = HardwareState::new();
@@ -445,5 +467,159 @@ mod tests {
         assert_eq!(state.history_read.back(), Some(&1_000_000));
         assert!((state.read_iops - 100.0).abs() < 0.001);
         assert!((state.read_lat_ms - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_shrinking_counter_skips_the_interval_instead_of_spiking() {
+        // An ejected drive drops out of the summed counters, so "now" reads
+        // lower than "before". Charting that as a delta would draw a spike.
+        let mut state = HardwareState::new();
+        let mut s = empty_sample();
+        s.disk = Some(counters(5_000_000, 5_000_000));
+        state.apply_sample(s);
+        let mut s = empty_sample();
+        s.disk = Some(counters(9_000_000, 9_000_000));
+        state.apply_sample(s);
+        let after_real_delta = state.history_read.len();
+        assert_eq!(after_real_delta, 1);
+
+        let mut s = empty_sample();
+        s.disk = Some(counters(1_000_000, 1_000_000));
+        state.apply_sample(s);
+        assert_eq!(state.history_read.len(), after_real_delta, "no sample charted");
+        // The shrunken reading still becomes the new baseline, so the next
+        // interval measures from it rather than staying stuck.
+        let mut s = empty_sample();
+        s.disk = Some(counters(3_000_000, 1_000_000));
+        state.apply_sample(s);
+        assert_eq!(state.history_read.back(), Some(&1_000_000));
+    }
+
+    #[test]
+    fn iops_and_latency_read_zero_when_no_ops_happened() {
+        let mut state = HardwareState::new();
+        let mut s = empty_sample();
+        s.disk = Some(counters(0, 0));
+        state.apply_sample(s);
+        let mut s = empty_sample();
+        s.disk = Some(counters(0, 0));
+        state.apply_sample(s);
+        // Dividing busy-time by zero ops would be NaN on screen.
+        assert_eq!(state.read_iops, 0.0);
+        assert_eq!(state.read_lat_ms, 0.0);
+        assert_eq!(state.write_lat_ms, 0.0);
+    }
+
+    #[test]
+    fn battery_watts_smooth_but_history_keeps_the_sign() {
+        let mut state = HardwareState::new();
+        let mut draining = empty_sample();
+        draining.battery = Some(BatterySnapshot { watts: -12.5, ..Default::default() });
+        state.apply_sample(draining);
+        let mut charging = empty_sample();
+        charging.battery = Some(BatterySnapshot { watts: 30.0, ..Default::default() });
+        state.apply_sample(charging);
+        // Deci-watts, negative while draining and positive while charging —
+        // the sign is what colors the flow chart.
+        assert_eq!(
+            state.history_watts.iter().copied().collect::<Vec<_>>(),
+            vec![-125, 300]
+        );
+        // The EMA lags the jump rather than snapping to it.
+        assert!(state.ema_watts > -12.5 && state.ema_watts < 30.0);
+    }
+
+    #[test]
+    fn package_power_is_charted_as_a_drain() {
+        // System power is always consumption, so it shares the battery
+        // chart's "negative = drawing power" convention.
+        let mut state = HardwareState::new();
+        let mut s = empty_sample();
+        s.system = Some(SystemPowerSnapshot { package_watts: 14.0, ..Default::default() });
+        state.apply_sample(s);
+        assert_eq!(state.history_package.back(), Some(&-140));
+        assert!(state.system.is_some());
+    }
+
+    #[test]
+    fn a_sample_without_a_battery_leaves_the_last_reading_alone() {
+        // A failed read shouldn't blank the panel mid-session.
+        let mut state = HardwareState::new();
+        let mut s = empty_sample();
+        s.battery = Some(BatterySnapshot { percent: 82, ..Default::default() });
+        state.apply_sample(s);
+        state.apply_sample(empty_sample());
+        assert_eq!(state.battery.as_ref().map(|b| b.percent), Some(82));
+        assert_eq!(state.history_watts.len(), 1);
+    }
+
+    #[test]
+    fn volumes_survive_an_empty_read_and_unmounted_waits_for_news() {
+        let mut state = HardwareState::new();
+        let vol = VolumeInfo {
+            name: "Macintosh HD".to_string(),
+            mount: "/".to_string(),
+            total: 1_000,
+            available: 250,
+            removable: false,
+        };
+        let mut s = empty_sample();
+        s.volumes = vec![vol.clone()];
+        s.unmounted = Some(vec![UnmountedVolume {
+            name: "EFI".to_string(),
+            device: "disk0s1".to_string(),
+            kind: "EFI".to_string(),
+            size: 500,
+        }]);
+        state.apply_sample(s);
+        // The fast loop sends unmounted: None every tick; that means "no
+        // news", not "the partitions vanished".
+        state.apply_sample(empty_sample());
+        assert_eq!(state.volumes.len(), 1);
+        assert_eq!(state.unmounted.len(), 1);
+    }
+
+    #[test]
+    fn volume_fill_is_used_over_total() {
+        let vol = |total, available| VolumeInfo {
+            name: "v".to_string(),
+            mount: "/".to_string(),
+            total,
+            available,
+            removable: false,
+        };
+        assert_eq!(vol(1_000, 250).used(), 750);
+        assert!((vol(1_000, 250).fill_frac() - 0.75).abs() < f64::EPSILON);
+        // Never divide by zero, and never report negative usage when a
+        // filesystem reports more free than total (reserved blocks).
+        assert_eq!(vol(0, 0).fill_frac(), 0.0);
+        assert_eq!(vol(100, 200).used(), 0);
+    }
+
+    #[test]
+    fn battery_health_is_capacity_against_design() {
+        let bat = |design, max| BatterySnapshot {
+            design_capacity_mah: design,
+            max_capacity_mah: max,
+            ..Default::default()
+        };
+        assert!((bat(1_000, 900).health_percent() - 90.0).abs() < 0.001);
+        // A missing design capacity reads as 0 rather than dividing by zero.
+        assert_eq!(bat(0, 900).health_percent(), 0.0);
+    }
+
+    #[test]
+    fn histories_evict_the_oldest_sample_at_the_cap() {
+        let mut h = VecDeque::new();
+        for i in 0..3 {
+            push_history(&mut h, i, 2);
+        }
+        assert_eq!(h.iter().copied().collect::<Vec<_>>(), vec![1, 2]);
+
+        let mut signed = VecDeque::new();
+        for i in 0..3i32 {
+            push_history_signed(&mut signed, -i, 2);
+        }
+        assert_eq!(signed.iter().copied().collect::<Vec<_>>(), vec![-1, -2]);
     }
 }

@@ -663,4 +663,70 @@ mod tests {
         ]);
         assert_eq!(rows, vec!["●", "●", "●"]);
     }
+
+    #[test]
+    fn trunk_refs_are_recognized_in_every_decoration_form() {
+        assert!(is_trunk_ref("main"));
+        assert!(is_trunk_ref("master"));
+        assert!(is_trunk_ref("origin/main"));
+        assert!(is_trunk_ref("origin/HEAD"));
+        // The checked-out form carries a "HEAD -> " prefix.
+        assert!(is_trunk_ref("HEAD -> main"));
+        assert!(is_trunk_ref("HEAD -> origin/master"));
+    }
+
+    #[test]
+    fn trunk_refs_dont_match_lookalike_branches() {
+        assert!(!is_trunk_ref("mainline"));
+        assert!(!is_trunk_ref("feature/main"));
+        assert!(!is_trunk_ref("tag: v1.0"));
+        assert!(!is_trunk_ref("upstream/main"));
+        assert!(!is_trunk_ref(""));
+    }
+
+    #[test]
+    fn an_empty_history_lays_out_to_nothing() {
+        // A repo with no commits in the window must not panic the renderer.
+        let layout = layout(&[]);
+        assert_eq!(layout.width, 0);
+        assert!(render(&[]).is_empty());
+    }
+
+    #[test]
+    fn every_row_is_padded_to_the_same_width() {
+        // Ragged rows would leave the commit text jagged down the pane.
+        let commits = vec![
+            commit("m", &["a", "b"]),
+            commit("a", &["base"]),
+            commit("b", &["base"]),
+            commit("base", &[]),
+        ];
+        let layout = layout(&commits);
+        for idx in 0..commits.len() {
+            let width: usize = prefix_spans(&layout, idx)
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum();
+            assert_eq!(width, layout.width, "row {idx} is ragged");
+        }
+    }
+
+    #[test]
+    fn commit_discs_are_bold_and_rails_are_not() {
+        let layout = layout(&[commit("a", &["b"]), commit("b", &[])]);
+        let bold: Vec<String> = prefix_spans(&layout, 0)
+            .into_iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::BOLD))
+            .map(|s| s.content.into_owned())
+            .collect();
+        assert_eq!(bold, ["●"]);
+    }
+
+    #[test]
+    fn lane_allocation_prefers_the_least_used_color() {
+        // With nothing in flight the first slot wins; with the trunk slot
+        // held, a new branch takes a different color.
+        assert_eq!(alloc_color(&[], false), 0);
+        assert_ne!(alloc_color(&[], true), 0);
+    }
 }

@@ -407,8 +407,12 @@ fn commits_in_window(path: &Path, author: Option<&str>) -> Vec<(u64, String)> {
         _ => return Vec::new(),
     };
 
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
+    parse_commit_log(&String::from_utf8_lossy(&out.stdout))
+}
+
+// "<unix ts>|<subject>" per line, as emitted by the --format above.
+fn parse_commit_log(text: &str) -> Vec<(u64, String)> {
+    text.lines()
         .filter_map(|line| {
             // splitn(2) so a '|' inside the subject doesn't break parsing.
             let mut parts = line.splitn(2, '|');
@@ -597,7 +601,12 @@ fn git_branches(path: &Path) -> Vec<BranchInfo> {
         _ => return Vec::new(),
     };
 
-    let text = String::from_utf8_lossy(&out.stdout);
+    parse_branch_refs(&String::from_utf8_lossy(&out.stdout))
+}
+
+// One `%(refname)|%(committerdate:unix)|%(upstream:track)|%(subject)` per
+// line, already sorted newest-first by git.
+fn parse_branch_refs(text: &str) -> Vec<BranchInfo> {
     let mut locals: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Each entry tagged with whether the ref is a local branch, so the
     // ordering pass below can float locals without re-guessing from the name
@@ -779,7 +788,13 @@ pub fn commit_stats(repo_dir: &Path) -> HashMap<String, CommitStat> {
         _ => return HashMap::new(),
     };
 
-    let text = String::from_utf8_lossy(&out.stdout);
+    parse_commit_stats(&String::from_utf8_lossy(&out.stdout))
+}
+
+// `--format=%x00%H` puts a NUL-prefixed sha before each commit's block; the
+// shortstat line (if any) follows it, so shas own every stat line until the
+// next sha appears.
+fn parse_commit_stats(text: &str) -> HashMap<String, CommitStat> {
     let mut stats = HashMap::new();
     let mut current: Option<String> = None;
     for line in text.lines() {
@@ -825,4 +840,397 @@ fn git_is_dirty(path: &Path) -> bool {
         .output()
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- %(upstream:track) ----------
+
+    #[test]
+    fn track_parses_every_shape_git_emits() {
+        assert_eq!(parse_track(""), (0, 0));
+        assert_eq!(parse_track("[gone]"), (0, 0));
+        assert_eq!(parse_track("[ahead 3]"), (3, 0));
+        assert_eq!(parse_track("[behind 2]"), (0, 2));
+        assert_eq!(parse_track("[ahead 3, behind 2]"), (3, 2));
+    }
+
+    #[test]
+    fn track_keeps_multi_digit_counts_whole() {
+        // Splitting on non-alphanumerics must not chop "120" into digits.
+        assert_eq!(parse_track("[ahead 120, behind 47]"), (120, 47));
+    }
+
+    #[test]
+    fn track_treats_unparseable_values_as_zero() {
+        // Never emitted by git, but a garbage value must read as "no drift"
+        // rather than panicking or inventing a count.
+        assert_eq!(parse_track("[ahead]"), (0, 0));
+        assert_eq!(parse_track("nonsense"), (0, 0));
+        assert_eq!(parse_track("[ahead 99999999999999999999]"), (0, 0));
+    }
+
+    // ---------- for-each-ref output ----------
+
+    fn branch_line(refname: &str, ts: u64, track: &str, subject: &str) -> String {
+        format!("{refname}|{ts}|{track}|{subject}")
+    }
+
+    #[test]
+    fn branch_refs_split_locals_from_remotes() {
+        let text = [
+            branch_line("refs/heads/main", 300, "[ahead 1]", "local tip"),
+            branch_line("refs/remotes/origin/feature", 200, "", "remote only"),
+        ]
+        .join("\n");
+        let branches = parse_branch_refs(&text);
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].name, "main");
+        assert_eq!(branches[0].ahead, 1);
+        assert_eq!(branches[0].last_commit, Some(300));
+        assert_eq!(branches[0].last_message, "local tip");
+        // Remote refs keep the "origin/" prefix so the UI can tell them apart.
+        assert_eq!(branches[1].name, "origin/feature");
+    }
+
+    #[test]
+    fn branch_refs_drop_remote_copies_of_local_branches() {
+        // origin/main duplicates main, which already carries ahead/behind.
+        let text = [
+            branch_line("refs/heads/main", 300, "[behind 4]", "subject"),
+            branch_line("refs/remotes/origin/main", 300, "", "subject"),
+            branch_line("refs/remotes/origin/solo", 100, "", "subject"),
+        ]
+        .join("\n");
+        let names: Vec<String> =
+            parse_branch_refs(&text).into_iter().map(|b| b.name).collect();
+        assert_eq!(names, ["main", "origin/solo"]);
+    }
+
+    #[test]
+    fn branch_refs_skip_the_origin_head_symref() {
+        let text = [
+            branch_line("refs/remotes/origin/HEAD", 300, "", ""),
+            branch_line("refs/remotes/origin/main", 300, "", "subject"),
+        ]
+        .join("\n");
+        let names: Vec<String> =
+            parse_branch_refs(&text).into_iter().map(|b| b.name).collect();
+        assert_eq!(names, ["origin/main"]);
+    }
+
+    #[test]
+    fn branch_refs_float_locals_above_remotes_keeping_date_order() {
+        // git sorts by committerdate; the local/remote regroup must be
+        // stable so newest-first survives within each group.
+        let text = [
+            branch_line("refs/remotes/origin/newest", 400, "", ""),
+            branch_line("refs/heads/newer", 300, "", ""),
+            branch_line("refs/remotes/origin/older", 200, "", ""),
+            branch_line("refs/heads/oldest", 100, "", ""),
+        ]
+        .join("\n");
+        let names: Vec<String> =
+            parse_branch_refs(&text).into_iter().map(|b| b.name).collect();
+        assert_eq!(names, ["newer", "oldest", "origin/newest", "origin/older"]);
+    }
+
+    #[test]
+    fn branch_refs_keep_a_local_branch_literally_named_like_a_remote() {
+        // A local branch may legally be called "origin/thing" — it must not
+        // be mistaken for a remote and stripped against the locals set.
+        let text = [
+            branch_line("refs/heads/origin/thing", 300, "", ""),
+            branch_line("refs/remotes/origin/thing", 300, "", ""),
+        ]
+        .join("\n");
+        let branches = parse_branch_refs(&text);
+        // Both survive: the remote's short name is "thing", which no local
+        // claims, and the oddly-named local is a local.
+        assert_eq!(branches.len(), 2);
+        assert_eq!(branches[0].name, "origin/thing");
+    }
+
+    #[test]
+    fn branch_refs_tolerate_pipes_in_subjects_and_missing_fields() {
+        let text = [
+            "refs/heads/main|300||fix: a|b|c pipeline".to_string(),
+            "refs/heads/nodate|not-a-number||subject".to_string(),
+            "refs/heads/short|300".to_string(),
+            "refs/tags/v1|300||tagged".to_string(),
+        ]
+        .join("\n");
+        let branches = parse_branch_refs(&text);
+        // splitn(4) leaves the rest of the line as the subject.
+        assert_eq!(branches[0].last_message, "fix: a|b|c pipeline");
+        // An unparseable date is None rather than a dropped branch.
+        assert_eq!(branches[1].last_commit, None);
+        // Missing trailing fields default rather than panic.
+        assert_eq!(branches[2].last_message, "");
+        // Refs that are neither heads nor remotes (tags) are skipped.
+        assert!(branches.iter().all(|b| b.name != "v1"));
+    }
+
+    // ---------- commit log ----------
+
+    #[test]
+    fn commit_log_parses_timestamp_and_subject() {
+        let text = "1700000000|feat: add thing\n1699999999|fix: break thing\n";
+        assert_eq!(
+            parse_commit_log(text),
+            vec![
+                (1_700_000_000, "feat: add thing".to_string()),
+                (1_699_999_999, "fix: break thing".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn commit_log_keeps_pipes_in_subjects_and_drops_junk_lines() {
+        let text = "1700000000|refactor: a|b\nnot a commit\n\n1699999999|";
+        assert_eq!(
+            parse_commit_log(text),
+            vec![
+                (1_700_000_000, "refactor: a|b".to_string()),
+                (1_699_999_999, String::new()),
+            ]
+        );
+    }
+
+    // ---------- shortstat ----------
+
+    #[test]
+    fn shortstat_parses_all_three_clauses() {
+        let stat = parse_shortstat(" 3 files changed, 40 insertions(+), 2 deletions(-)")
+            .expect("line contains 'changed'");
+        assert_eq!((stat.files, stat.insertions, stat.deletions), (3, 40, 2));
+    }
+
+    #[test]
+    fn shortstat_handles_missing_clauses_and_singulars() {
+        let only_ins = parse_shortstat(" 1 file changed, 1 insertion(+)").unwrap();
+        assert_eq!((only_ins.files, only_ins.insertions, only_ins.deletions), (1, 1, 0));
+        let only_del = parse_shortstat(" 2 files changed, 7 deletions(-)").unwrap();
+        assert_eq!((only_del.files, only_del.insertions, only_del.deletions), (2, 0, 7));
+    }
+
+    #[test]
+    fn shortstat_rejects_lines_that_are_not_shortstats() {
+        assert!(parse_shortstat("").is_none());
+        assert!(parse_shortstat("commit abc123").is_none());
+        // A subject that merely mentions insertions isn't a stat line.
+        assert!(parse_shortstat("fix: 3 insertions were wrong").is_none());
+    }
+
+    #[test]
+    fn commit_stats_key_each_block_by_its_sha() {
+        let text = "\u{0}aaa111\n 2 files changed, 5 insertions(+)\n\
+                    \u{0}bbb222\n\u{0}ccc333\n 1 file changed, 9 deletions(-)\n";
+        let stats = parse_commit_stats(text);
+        // The merge commit in the middle emits no shortstat and is absent.
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats["aaa111"].insertions, 5);
+        assert_eq!(stats["ccc333"].deletions, 9);
+        assert!(!stats.contains_key("bbb222"));
+    }
+
+    #[test]
+    fn commit_stats_ignore_a_stat_line_before_any_sha() {
+        let stats = parse_commit_stats(" 1 file changed, 1 insertion(+)\n");
+        assert!(stats.is_empty());
+    }
+
+    // ---------- graph rows ----------
+
+    fn graph_line(fields: &[&str]) -> String {
+        fields.join("\u{1f}")
+    }
+
+    #[test]
+    fn graph_line_parses_a_full_row() {
+        let line = graph_line(&[
+            "abc123",
+            "1700000000",
+            "Andrew",
+            "feat: thing",
+            "HEAD -> main, origin/main",
+            "def456",
+            "2026-07-11 14:32",
+        ]);
+        let row = parse_graph_line(&line).unwrap();
+        assert_eq!(row.sha, "abc123");
+        assert_eq!(row.timestamp, Some(1_700_000_000));
+        assert_eq!(row.author, "Andrew");
+        assert_eq!(row.subject, "feat: thing");
+        assert_eq!(row.refs, ["HEAD -> main", "origin/main"]);
+        assert_eq!(row.parents, ["def456"]);
+        assert_eq!(row.date, "2026-07-11 14:32");
+    }
+
+    #[test]
+    fn graph_line_reads_a_merge_as_two_parents() {
+        let line = graph_line(&["abc", "1", "A", "merge", "", "p1 p2", "date"]);
+        let row = parse_graph_line(&line).unwrap();
+        assert_eq!(row.parents, ["p1", "p2"]);
+        // No decoration ⇒ no refs, not one empty ref.
+        assert!(row.refs.is_empty());
+    }
+
+    #[test]
+    fn graph_line_handles_root_commits_and_bad_rows() {
+        let root = parse_graph_line(&graph_line(&["abc", "1", "A", "s", "", "", "d"]))
+            .unwrap();
+        assert!(root.parents.is_empty());
+        // An empty sha is the one shape we refuse outright.
+        assert!(parse_graph_line("").is_none());
+        assert!(parse_graph_line(&graph_line(&["", "1", "A", "s", "", "", "d"])).is_none());
+        // A truncated row still yields a usable sha rather than panicking.
+        let short = parse_graph_line("abc123").unwrap();
+        assert_eq!(short.sha, "abc123");
+        assert_eq!(short.timestamp, None);
+    }
+
+    #[test]
+    fn graph_line_keeps_separators_that_appear_inside_a_subject() {
+        // Subjects can contain anything printable — including the commas and
+        // pipes other formats use as delimiters.
+        let line = graph_line(&["abc", "1", "A", "fix: a, b | c", "tag: v1", "", "d"]);
+        let row = parse_graph_line(&line).unwrap();
+        assert_eq!(row.subject, "fix: a, b | c");
+        assert_eq!(row.refs, ["tag: v1"]);
+    }
+
+    // ---------- remote URLs ----------
+
+    #[test]
+    fn remote_urls_shorten_to_owner_repo() {
+        assert_eq!(shorten_remote_url("git@github.com:owner/repo.git"), "owner/repo");
+        assert_eq!(shorten_remote_url("https://github.com/owner/repo.git"), "owner/repo");
+        assert_eq!(shorten_remote_url("https://github.com/owner/repo"), "owner/repo");
+        // Trailing slash and surrounding whitespace are noise.
+        assert_eq!(shorten_remote_url("  https://host/owner/repo/  "), "owner/repo");
+    }
+
+    #[test]
+    fn remote_urls_that_dont_split_pass_through() {
+        assert_eq!(shorten_remote_url("repo"), "repo");
+        assert_eq!(shorten_remote_url(""), "");
+        // A deep path keeps only the last two segments.
+        assert_eq!(shorten_remote_url("https://host/a/b/c/d.git"), "c/d");
+    }
+
+    // ---------- pull messages ----------
+
+    #[test]
+    fn pull_success_recognizes_an_up_to_date_pull() {
+        assert_eq!(pull_success_message("Already up to date.\n"), "already up to date");
+    }
+
+    #[test]
+    fn pull_success_quotes_the_shortstat_line() {
+        let stdout = "Updating abc..def\nFast-forward\n \
+                      3 files changed, 40 insertions(+), 2 deletions(-)\n";
+        assert_eq!(
+            pull_success_message(stdout),
+            "pulled — 3 files changed, 40 insertions(+), 2 deletions(-)"
+        );
+    }
+
+    #[test]
+    fn pull_success_falls_back_when_git_says_nothing_useful() {
+        assert_eq!(pull_success_message(""), "pulled latest");
+    }
+
+    #[test]
+    fn pull_error_prefers_the_fatal_or_error_line() {
+        let stderr = "remote: Enumerating objects\n\
+                      fatal: Not possible to fast-forward, aborting.\n\
+                      hint: try a merge\n";
+        assert_eq!(
+            pull_error_message(stderr),
+            "Not possible to fast-forward, aborting."
+        );
+        assert_eq!(
+            pull_error_message("error: cannot pull with rebase\n"),
+            "cannot pull with rebase"
+        );
+    }
+
+    #[test]
+    fn pull_error_falls_back_to_the_first_real_line_then_a_default() {
+        assert_eq!(
+            pull_error_message("\n\n  something went wrong  \nmore noise\n"),
+            "something went wrong"
+        );
+        assert_eq!(pull_error_message(""), "pull failed");
+        assert_eq!(pull_error_message("   \n\n"), "pull failed");
+    }
+
+    // ---------- Scanner wake semantics ----------
+
+    // A Scanner wired to test channels instead of live threads, so the
+    // refresh/rescan split can be asserted without shelling out to git.
+    fn test_scanner() -> (Scanner, Receiver<()>, Receiver<()>) {
+        let (_tree_tx, tree_rx) = mpsc::channel();
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let (fetch_wake_tx, fetch_wake_rx) = mpsc::channel();
+        let scanner = Scanner {
+            tree_rx,
+            wake_tx,
+            fetch_wake_tx,
+            fetching: Arc::new(AtomicBool::new(false)),
+            root: Arc::new(Mutex::new(PathBuf::from("/tmp/code"))),
+        };
+        (scanner, wake_rx, fetch_wake_rx)
+    }
+
+    #[test]
+    fn rescan_wakes_only_the_scan_thread() {
+        // The cheap 'r' refresh: local state only, no network round trip.
+        let (scanner, wake_rx, fetch_wake_rx) = test_scanner();
+        scanner.rescan();
+        assert!(wake_rx.try_recv().is_ok());
+        assert!(fetch_wake_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn refresh_wakes_both_threads() {
+        // Shift-R: the scan lands immediately, the fetch follows.
+        let (scanner, wake_rx, fetch_wake_rx) = test_scanner();
+        scanner.refresh();
+        assert!(wake_rx.try_recv().is_ok());
+        assert!(fetch_wake_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn set_root_swaps_the_path_and_refreshes() {
+        let (scanner, wake_rx, fetch_wake_rx) = test_scanner();
+        scanner.set_root(PathBuf::from("/tmp/other"));
+        assert_eq!(*scanner.root.lock().unwrap(), PathBuf::from("/tmp/other"));
+        // Switching dirs must not leave the old root's counts on screen.
+        assert!(wake_rx.try_recv().is_ok());
+        assert!(fetch_wake_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn waking_a_dead_thread_is_silent() {
+        // Receivers dropped = threads exiting. The UI still calls these on
+        // the way out, so they must not panic on SendError.
+        let (scanner, wake_rx, fetch_wake_rx) = test_scanner();
+        drop(wake_rx);
+        drop(fetch_wake_rx);
+        scanner.rescan();
+        scanner.refresh();
+        scanner.set_root(PathBuf::from("/tmp/x"));
+    }
+
+    #[test]
+    fn is_fetching_reports_the_shared_flag() {
+        let (scanner, _w, _f) = test_scanner();
+        assert!(!scanner.is_fetching());
+        scanner.fetching.store(true, Ordering::Relaxed);
+        assert!(scanner.is_fetching());
+    }
 }

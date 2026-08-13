@@ -281,7 +281,7 @@ impl DirectoryPrompt {
 
 // Focus stops inside the ActionPrompt, top to bottom: two text fields and
 // the close-terminal checkbox. Tab wraps around; Up/Down stop at the ends.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ActionField {
     Name,
     Command,
@@ -5466,3 +5466,701 @@ fn draw_claude_detail(f: &mut Frame, app: &App, project: &ProjectSessions, area:
     f.render_widget(para, area);
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn key_with(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    // -------------------- refresh keys --------------------
+
+    #[test]
+    fn lowercase_r_asks_for_the_cheap_local_rescan() {
+        assert_eq!(
+            refresh_request(Tab::GitStatus, key(KeyCode::Char('r'))),
+            Some(RefreshKind::Local)
+        );
+    }
+
+    #[test]
+    fn shift_r_asks_for_a_fetch_too() {
+        // Terminals deliver Shift-R as 'R'; the redundant SHIFT modifier
+        // must not disqualify it.
+        assert_eq!(
+            refresh_request(Tab::GitStatus, key(KeyCode::Char('R'))),
+            Some(RefreshKind::WithFetch)
+        );
+        assert_eq!(
+            refresh_request(Tab::GitStatus, key_with(KeyCode::Char('R'), KeyModifiers::SHIFT)),
+            Some(RefreshKind::WithFetch)
+        );
+    }
+
+    #[test]
+    fn control_r_is_left_for_the_shared_handler() {
+        // Ctrl-C is the quit path; nothing with CONTROL held may be eaten
+        // by the refresh binding.
+        assert_eq!(
+            refresh_request(Tab::GitStatus, key_with(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            refresh_request(
+                Tab::GitStatus,
+                key_with(KeyCode::Char('R'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            ),
+            None
+        );
+        assert_eq!(
+            refresh_request(Tab::GitStatus, key_with(KeyCode::Char('r'), KeyModifiers::ALT)),
+            None
+        );
+    }
+
+    #[test]
+    fn refresh_keys_are_inert_off_the_git_tab() {
+        // 'r' means nothing on the other tabs, and must stay available to
+        // their own handlers.
+        for tab in [Tab::Processes, Tab::Network, Tab::DiskPower, Tab::Claude] {
+            assert_eq!(refresh_request(tab, key(KeyCode::Char('r'))), None);
+            assert_eq!(refresh_request(tab, key(KeyCode::Char('R'))), None);
+        }
+    }
+
+    #[test]
+    fn other_keys_are_not_refresh_requests() {
+        for code in [KeyCode::Char('q'), KeyCode::Char('j'), KeyCode::Enter, KeyCode::Up] {
+            assert_eq!(refresh_request(Tab::GitStatus, key(code)), None);
+        }
+    }
+
+    // -------------------- tab cycling --------------------
+
+    #[test]
+    fn tab_indexes_match_the_strip_order() {
+        for (i, tab) in TABS.iter().enumerate() {
+            assert_eq!(tab.index(), i);
+        }
+        assert_eq!(TABS.len(), TAB_LABELS.len());
+    }
+
+    #[test]
+    fn tab_key_maps_to_a_direction() {
+        assert_eq!(App::tab_cycle_delta(key(KeyCode::Tab)), Some(1));
+        // Shift-Tab arrives as BackTab on most terminals, as Tab+SHIFT on others.
+        assert_eq!(App::tab_cycle_delta(key(KeyCode::BackTab)), Some(-1));
+        assert_eq!(
+            App::tab_cycle_delta(key_with(KeyCode::Tab, KeyModifiers::SHIFT)),
+            Some(-1)
+        );
+        assert_eq!(App::tab_cycle_delta(key(KeyCode::Char('r'))), None);
+        assert_eq!(App::tab_cycle_delta(key(KeyCode::Right)), None);
+    }
+
+    // -------------------- InputLine --------------------
+
+    #[test]
+    fn input_line_starts_with_the_cursor_at_the_end() {
+        let line = InputLine::new("~/code".to_string());
+        assert_eq!(line.cursor, 6);
+        assert_eq!(InputLine::empty().cursor, 0);
+    }
+
+    #[test]
+    fn input_line_inserts_at_the_cursor() {
+        let mut line = InputLine::new("ac".to_string());
+        line.move_left();
+        line.insert('b');
+        assert_eq!(line.input, "abc");
+        assert_eq!(line.cursor, 2);
+    }
+
+    #[test]
+    fn input_line_edits_multibyte_text_without_panicking() {
+        // Char positions, not byte offsets: "é" is 2 bytes, "→" is 3.
+        let mut line = InputLine::new("héllo→".to_string());
+        assert_eq!(line.cursor, 6);
+        line.backspace();
+        assert_eq!(line.input, "héllo");
+        line.home();
+        line.delete();
+        assert_eq!(line.input, "éllo");
+        line.insert('ü');
+        assert_eq!(line.input, "üéllo");
+        assert_eq!(line.cursor, 1);
+    }
+
+    #[test]
+    fn input_line_cursor_stops_at_both_ends() {
+        let mut line = InputLine::new("ab".to_string());
+        line.end();
+        line.move_right();
+        assert_eq!(line.cursor, 2);
+        line.home();
+        line.move_left();
+        assert_eq!(line.cursor, 0);
+        // Backspace at the start and delete at the end are no-ops.
+        line.backspace();
+        assert_eq!(line.input, "ab");
+        line.end();
+        line.delete();
+        assert_eq!(line.input, "ab");
+    }
+
+    #[test]
+    fn kill_word_back_eats_trailing_space_then_the_word() {
+        let mut line = InputLine::new("foo bar ".to_string());
+        line.kill_word_back();
+        assert_eq!(line.input, "foo ");
+        line.kill_word_back();
+        assert_eq!(line.input, "");
+        assert_eq!(line.cursor, 0);
+    }
+
+    #[test]
+    fn kill_word_back_only_touches_text_left_of_the_cursor() {
+        let mut line = InputLine::new("one two three".to_string());
+        line.home();
+        // Nothing to the left — no-op.
+        line.kill_word_back();
+        assert_eq!(line.input, "one two three");
+        for _ in 0..7 {
+            line.move_right();
+        }
+        line.kill_word_back();
+        // Only the word dies — the space that preceded it stays, so the
+        // text to the right of the cursor is untouched.
+        assert_eq!(line.input, "one  three");
+        assert_eq!(line.cursor, 4);
+    }
+
+    #[test]
+    fn clear_line_empties_input_and_cursor() {
+        let mut line = InputLine::new("something".to_string());
+        line.clear_line();
+        assert_eq!(line.input, "");
+        assert_eq!(line.cursor, 0);
+        assert_eq!(line.char_count(), 0);
+    }
+
+    #[test]
+    fn byte_at_past_the_end_clamps_to_the_length() {
+        let line = InputLine::new("é".to_string());
+        assert_eq!(line.byte_at(0), 0);
+        assert_eq!(line.byte_at(1), 2);
+        assert_eq!(line.byte_at(99), 2);
+    }
+
+    // -------------------- input_window --------------------
+
+    #[test]
+    fn input_window_shows_everything_when_it_fits() {
+        let (visible, cursor) = input_window("abc", 3, 10);
+        assert_eq!(visible, "abc");
+        assert_eq!(cursor, 3);
+    }
+
+    #[test]
+    fn input_window_scrolls_to_keep_the_caret_visible() {
+        // cap = width - 1 = 5, margin = 1 (cap/4), so the caret sits one
+        // cell in from the left edge while scrolling.
+        let (visible, cursor) = input_window("abcdefghij", 7, 6);
+        assert_eq!(visible.chars().count(), 5);
+        assert!(cursor <= 5);
+        assert_eq!(visible.chars().nth(cursor - 1), Some('g'));
+    }
+
+    #[test]
+    fn input_window_pins_to_the_end_of_a_long_input() {
+        let (visible, cursor) = input_window("abcdefghij", 10, 6);
+        assert_eq!(visible, "fghij");
+        // Caret parks in the reserved trailing column.
+        assert_eq!(cursor, 5);
+    }
+
+    #[test]
+    fn input_window_degenerate_widths_render_nothing() {
+        assert_eq!(input_window("abc", 1, 0), (String::new(), 0));
+        assert_eq!(input_window("abc", 1, 1), (String::new(), 0));
+    }
+
+    #[test]
+    fn input_window_counts_characters_not_bytes() {
+        let (visible, _) = input_window("ééééé", 5, 4);
+        assert_eq!(visible.chars().count(), 3);
+    }
+
+    // -------------------- formatting --------------------
+
+    #[test]
+    fn age_switches_unit_at_each_boundary() {
+        assert_eq!(format_age(0), "0s ago");
+        assert_eq!(format_age(59), "59s ago");
+        assert_eq!(format_age(60), "1m ago");
+        assert_eq!(format_age(3_599), "59m ago");
+        assert_eq!(format_age(3_600), "1h ago");
+        assert_eq!(format_age(86_399), "23h ago");
+        assert_eq!(format_age(86_400), "1d ago");
+        assert_eq!(format_age(2_591_999), "29d ago");
+        assert_eq!(format_age(2_592_000), "1mo ago");
+    }
+
+    #[test]
+    fn short_age_drops_the_suffix_at_the_same_boundaries() {
+        assert_eq!(format_age_short(59), "59s");
+        assert_eq!(format_age_short(60), "1m");
+        assert_eq!(format_age_short(3_600), "1h");
+        assert_eq!(format_age_short(86_400), "1d");
+        assert_eq!(format_age_short(2_592_000), "1mo");
+    }
+
+    #[test]
+    fn truncate_leaves_short_strings_alone() {
+        assert_eq!(truncate("abc", 3), "abc");
+        assert_eq!(truncate("abc", 10), "abc");
+        assert_eq!(truncate("", 0), "");
+    }
+
+    #[test]
+    fn truncate_replaces_the_last_char_with_an_ellipsis() {
+        assert_eq!(truncate("abcdef", 4), "abc…");
+        // The result is `max` chars wide, so columns still line up.
+        assert_eq!(truncate("abcdef", 4).chars().count(), 4);
+    }
+
+    #[test]
+    fn truncate_cuts_on_char_boundaries() {
+        // Bytes would slice "é" in half and panic.
+        assert_eq!(truncate("ééééé", 3), "éé…");
+        assert_eq!(truncate("→→→", 2), "→…");
+    }
+
+    #[test]
+    fn truncate_at_max_zero_yields_just_the_ellipsis() {
+        assert_eq!(truncate("abc", 0), "…");
+    }
+
+    #[test]
+    fn bps_uses_decimal_si_steps() {
+        assert_eq!(format_bps(0.0), "0 B/s");
+        assert_eq!(format_bps(999.0), "999 B/s");
+        assert_eq!(format_bps(1_000.0), "1.0 KB/s");
+        assert_eq!(format_bps(1_000_000.0), "1.00 MB/s");
+        assert_eq!(format_bps(1_000_000_000.0), "1.00 GB/s");
+    }
+
+    #[test]
+    fn bps_clamps_negative_rates_to_zero() {
+        // A counter regression must never render as "-5 B/s".
+        assert_eq!(format_bps(-5.0), "0 B/s");
+    }
+
+    #[test]
+    fn mem_uses_binary_steps_like_activity_monitor() {
+        assert_eq!(format_mem(0), "0 KB");
+        assert_eq!(format_mem(1024), "1 KB");
+        assert_eq!(format_mem(1024 * 1024), "1 MB");
+        assert_eq!(format_mem(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(format_mem(3 * 1024 * 1024 * 1024 / 2), "1.5 GB");
+    }
+
+    #[test]
+    fn tokens_abbreviate_past_a_thousand() {
+        assert_eq!(format_tokens(0), "0 tok");
+        assert_eq!(format_tokens(850), "850 tok");
+        assert_eq!(format_tokens(999), "999 tok");
+        assert_eq!(format_tokens(12_400), "12.4k tok");
+        assert_eq!(format_tokens(1_200_000), "1.2M tok");
+    }
+
+    #[test]
+    fn cost_shows_cents_only_under_ten_dollars() {
+        assert_eq!(format_cost(0.0), "~$0.00");
+        assert_eq!(format_cost(0.425), "~$0.42");
+        assert_eq!(format_cost(9.99), "~$9.99");
+        assert_eq!(format_cost(34.2), "~$34");
+    }
+
+    #[test]
+    fn duration_reads_as_wall_clock() {
+        assert_eq!(format_duration(40), "40s");
+        assert_eq!(format_duration(59), "59s");
+        assert_eq!(format_duration(60), "1m");
+        assert_eq!(format_duration(2_700), "45m");
+        assert_eq!(format_duration(3_600), "1h 00m");
+        assert_eq!(format_duration(46_020), "12h 47m");
+    }
+
+    #[test]
+    fn minutes_roll_into_hours() {
+        assert_eq!(format_minutes(0), "0m");
+        assert_eq!(format_minutes(59), "59m");
+        assert_eq!(format_minutes(60), "1h 00m");
+        assert_eq!(format_minutes(125), "2h 05m");
+    }
+
+    #[test]
+    fn watt_labels_hide_a_pointless_decimal() {
+        assert_eq!(format_watts_label(12.0), "12");
+        assert_eq!(format_watts_label(12.02), "12");
+        assert_eq!(format_watts_label(2.5), "2.5");
+        assert_eq!(format_watts_label(0.0), "0");
+    }
+
+    // -------------------- charts --------------------
+
+    #[test]
+    fn nice_ceil_snaps_to_one_two_or_five() {
+        assert_eq!(nice_ceil(0), 1);
+        assert_eq!(nice_ceil(1), 1);
+        assert_eq!(nice_ceil(3), 5);
+        assert_eq!(nice_ceil(5), 5);
+        assert_eq!(nice_ceil(6), 10);
+        assert_eq!(nice_ceil(11), 20);
+        assert_eq!(nice_ceil(21), 50);
+        assert_eq!(nice_ceil(1_000), 1_000);
+    }
+
+    #[test]
+    fn nice_ceil_terminates_on_huge_inputs() {
+        // The saturating steps must not spin forever near u32::MAX.
+        assert_eq!(nice_ceil(u32::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn axis_ticks_thin_out_on_short_charts() {
+        assert_eq!(axis_ticks(20, 100).len(), 5);
+        assert_eq!(axis_ticks(14, 100).len(), 5);
+        assert_eq!(axis_ticks(13, 100).len(), 3);
+        assert_eq!(axis_ticks(6, 100).len(), 3);
+        assert_eq!(axis_ticks(5, 100).len(), 2);
+    }
+
+    #[test]
+    fn axis_ticks_run_top_down_with_the_scale_at_the_top() {
+        let ticks = axis_ticks(21, 100);
+        assert_eq!(ticks[0], (0, 10.0));
+        assert_eq!(ticks.last().copied(), Some((20, 0.0)));
+    }
+
+    #[test]
+    fn axis_ticks_never_label_a_row_twice() {
+        // Two ticks on one row would overprint the gutter label.
+        for rows in 0..40 {
+            let mut seen = std::collections::HashSet::new();
+            for (row, _) in axis_ticks(rows, 100) {
+                assert!(seen.insert(row), "row {row} labelled twice at rows={rows}");
+            }
+        }
+    }
+
+    #[test]
+    fn axis_ticks_still_top_out_at_the_scale_on_a_degenerate_chart() {
+        // rows 0 and 1 both collapse to denom 1. The bottom tick lands on a
+        // row the chart doesn't have, which the renderer's row lookup simply
+        // never matches — but the top tick must still read as the scale.
+        for rows in [0, 1] {
+            assert_eq!(axis_ticks(rows, 50)[0], (0, 5.0));
+        }
+    }
+
+    #[test]
+    fn sparkline_is_blank_at_zero_width() {
+        let history = std::collections::VecDeque::from(vec![1, 2, 3]);
+        assert_eq!(build_sparkline(&history, 0), "");
+    }
+
+    #[test]
+    fn sparkline_left_pads_until_it_has_enough_samples() {
+        let history = std::collections::VecDeque::from(vec![4u32]);
+        let spark = build_sparkline(&history, 4);
+        assert_eq!(spark.chars().count(), 4);
+        assert!(spark.starts_with("   "));
+        // A lone sample is its own max, so it renders full height.
+        assert_eq!(spark.chars().nth(3), Some('█'));
+    }
+
+    #[test]
+    fn sparkline_scales_against_the_series_peak() {
+        let history = std::collections::VecDeque::from(vec![0u32, 50, 100]);
+        let spark: Vec<char> = build_sparkline(&history, 3).chars().collect();
+        // Idle samples are blank so bursts stand out.
+        assert_eq!(spark[0], ' ');
+        assert_eq!(spark[2], '█');
+        // The midpoint lands mid-ramp, not at either extreme.
+        assert!(SPARK_CHARS.contains(&spark[1]));
+        assert_ne!(spark[1], '█');
+    }
+
+    #[test]
+    fn sparkline_keeps_the_newest_samples_when_history_overflows() {
+        let history = std::collections::VecDeque::from(vec![100u32, 0, 0, 1]);
+        let spark: Vec<char> = build_sparkline(&history, 2).chars().collect();
+        assert_eq!(spark.len(), 2);
+        // Oldest (the 100 peak) is dropped; the tail is [0, 1].
+        assert_eq!(spark[0], ' ');
+        assert_ne!(spark[1], ' ');
+    }
+
+    #[test]
+    fn heatmap_color_darkens_toward_zero() {
+        let empty = Color::Rgb(40, 44, 52);
+        assert_eq!(heatmap_color(0, 10), empty);
+        // No commits anywhere: every cell is the empty shade.
+        assert_eq!(heatmap_color(5, 0), empty);
+        assert_ne!(heatmap_color(1, 10), empty);
+        // Brightness is monotonic in the count.
+        let shades = [
+            heatmap_color(1, 100),
+            heatmap_color(20, 100),
+            heatmap_color(50, 100),
+            heatmap_color(100, 100),
+        ];
+        for pair in shades.windows(2) {
+            assert_ne!(pair[0], pair[1]);
+        }
+    }
+
+    #[test]
+    fn app_accents_are_stable_and_inside_the_palette() {
+        assert_eq!(app_accent("Google Chrome"), app_accent("Google Chrome"));
+        assert!(APP_ACCENTS.contains(&app_accent("Google Chrome")));
+        assert!(APP_ACCENTS.contains(&app_accent("")));
+        // The hash spreads names across slots rather than collapsing them.
+        let distinct: std::collections::HashSet<Color> =
+            ["a", "b", "c", "d", "e", "f", "g", "h"].iter().map(|n| app_accent(n)).collect();
+        assert!(distinct.len() > 1);
+    }
+
+    // -------------------- calendar --------------------
+
+    #[test]
+    fn civil_from_days_converts_the_epoch_and_beyond() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(1), (1970, 1, 2));
+        assert_eq!(civil_from_days(365), (1971, 1, 1));
+        // 2000 was a leap year (divisible by 400); 1900 was not.
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+        assert_eq!(civil_from_days(19_723), (2024, 1, 1));
+    }
+
+    #[test]
+    fn civil_from_days_handles_pre_epoch_days() {
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(civil_from_days(-365), (1969, 1, 1));
+    }
+
+    #[test]
+    fn month_labels_land_on_their_rollover_column() {
+        // Four weeks: Jan, Jan, Feb, Feb — each label starts at the column
+        // where its month first appears.
+        let line = month_label_row(&[1, 1, 2, 2], &[false; 4]);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        // Leading 4-space gutter, then two cells per week.
+        assert_eq!(text, "    Jan Feb ");
+    }
+
+    #[test]
+    fn month_labels_clip_at_the_right_edge_instead_of_wrapping() {
+        // "Feb" starts in the last week's cell with only two columns left.
+        let line = month_label_row(&[1, 1, 2], &[false; 3]);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "    Jan Fe");
+    }
+
+    #[test]
+    fn month_labels_yield_to_separators_only_in_free_gaps() {
+        let line = month_label_row(&[1, 2, 2, 2], &[true, true, true, true]);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        // The separator glyph appears where no label letter claims the gap.
+        assert!(text.contains('│'));
+    }
+
+    // -------------------- scrolling --------------------
+
+    #[test]
+    fn scroll_into_view_leaves_a_visible_selection_alone() {
+        let cell = Cell::new(0);
+        assert_eq!(scroll_into_view(&cell, Some((2, 3)), 20, 10), 0);
+        assert_eq!(cell.get(), 0);
+    }
+
+    #[test]
+    fn scroll_into_view_reveals_a_selection_above_the_viewport() {
+        let cell = Cell::new(8);
+        assert_eq!(scroll_into_view(&cell, Some((3, 2)), 40, 10), 3);
+    }
+
+    #[test]
+    fn scroll_into_view_pulls_up_a_selection_past_the_bottom() {
+        // Item occupies lines 12..15 in a 10-line viewport scrolled to 0.
+        let cell = Cell::new(0);
+        assert_eq!(scroll_into_view(&cell, Some((12, 3)), 40, 10), 5);
+    }
+
+    #[test]
+    fn scroll_into_view_anchors_items_taller_than_the_viewport() {
+        // Can't show all of it, so show its header rather than its tail.
+        let cell = Cell::new(0);
+        assert_eq!(scroll_into_view(&cell, Some((12, 30)), 60, 10), 12);
+    }
+
+    #[test]
+    fn scroll_into_view_clamps_to_the_last_full_screen() {
+        let cell = Cell::new(99);
+        assert_eq!(scroll_into_view(&cell, None, 20, 10), 10);
+        // Content shorter than the viewport can't scroll at all.
+        let cell = Cell::new(5);
+        assert_eq!(scroll_into_view(&cell, None, 4, 10), 0);
+    }
+
+    // -------------------- git tree rendering --------------------
+
+    fn branch(name: &str) -> git::BranchInfo {
+        git::BranchInfo {
+            name: name.to_string(),
+            is_current: false,
+            ahead: 0,
+            behind: 0,
+            last_commit: Some(1_700_000_000),
+            last_message: "subject".to_string(),
+        }
+    }
+
+    #[test]
+    fn trunk_pick_prefers_main_over_other_conventions() {
+        let branches = [branch("develop"), branch("master"), branch("main")];
+        assert_eq!(pick_trunk_idx(&branches), Some(2));
+        let branches = [branch("develop"), branch("master")];
+        assert_eq!(pick_trunk_idx(&branches), Some(1));
+    }
+
+    #[test]
+    fn trunk_pick_falls_back_to_a_remote_only_trunk() {
+        // A freshly cloned repo may have no local trunk checked out.
+        let branches = [branch("feature"), branch("origin/main")];
+        assert_eq!(pick_trunk_idx(&branches), Some(1));
+        // A local trunk still wins over a remote one.
+        let branches = [branch("origin/main"), branch("main")];
+        assert_eq!(pick_trunk_idx(&branches), Some(1));
+    }
+
+    #[test]
+    fn trunk_pick_gives_up_when_nothing_looks_like_a_trunk() {
+        assert_eq!(pick_trunk_idx(&[branch("feature"), branch("wip")]), None);
+        assert_eq!(pick_trunk_idx(&[]), None);
+    }
+
+    // -------------------- claude cards --------------------
+
+    fn session(id: &str, title: &str, last_activity: u64) -> claude::SessionInfo {
+        claude::SessionInfo {
+            id: id.to_string(),
+            title: title.to_string(),
+            last_prompt: String::new(),
+            last_activity,
+            prompt_count: 1,
+            git_branch: None,
+            duration_secs: 0,
+            output_tokens: 0,
+            cost_usd: 0.0,
+            tool_counts: Vec::new(),
+            models: Vec::new(),
+            live: None,
+        }
+    }
+
+    #[test]
+    fn session_titles_fall_back_to_the_id_prefix() {
+        assert_eq!(
+            claude_session_title(&session("abc", "fix the parser", 0)),
+            "fix the parser"
+        );
+        assert_eq!(
+            claude_session_title(&session("0c1d2e3f-4567", "", 0)),
+            "session 0c1d2e3f"
+        );
+        // A short id must not panic on the 8-char slice.
+        assert_eq!(claude_session_title(&session("abc", "", 0)), "session abc");
+    }
+
+    #[test]
+    fn session_bullets_fade_with_age() {
+        let now = 1_700_000_000;
+        let mut live = session("a", "t", now);
+        live.live = Some(claude::LiveSession {
+            pid: 1,
+            name: "system-stats-0c".to_string(),
+            status: "busy".to_string(),
+        });
+        assert_eq!(claude_session_bullet(&live, now).0, "●");
+        // Under a day old reads as present, older fades out.
+        assert_eq!(claude_session_bullet(&session("b", "t", now - 3_600), now).0, "○");
+        assert_eq!(claude_session_bullet(&session("c", "t", now - 90_000), now).0, "·");
+    }
+
+    #[test]
+    fn session_bullets_survive_a_future_timestamp() {
+        // Clock skew on the transcript's mtime must not underflow.
+        let now = 1_700_000_000;
+        assert_eq!(claude_session_bullet(&session("a", "t", now + 500), now).0, "○");
+    }
+
+    // -------------------- modal field navigation --------------------
+
+    #[test]
+    fn action_fields_cycle_with_tab_and_wrap() {
+        assert_eq!(ActionField::Name.next(), ActionField::Command);
+        assert_eq!(ActionField::Command.next(), ActionField::CloseToggle);
+        assert_eq!(ActionField::CloseToggle.next(), ActionField::Name);
+        assert_eq!(ActionField::Name.prev(), ActionField::CloseToggle);
+        assert_eq!(ActionField::CloseToggle.prev(), ActionField::Command);
+    }
+
+    #[test]
+    fn action_fields_stop_at_the_ends_with_arrows() {
+        assert_eq!(ActionField::Name.up(), ActionField::Name);
+        assert_eq!(ActionField::CloseToggle.down(), ActionField::CloseToggle);
+        assert_eq!(ActionField::Command.up(), ActionField::Name);
+        assert_eq!(ActionField::Command.down(), ActionField::CloseToggle);
+    }
+
+    #[test]
+    fn menu_titles_say_how_to_get_out() {
+        for menu in [Menu::main(), Menu::settings(), Menu::repo_action()] {
+            assert_eq!(menu.selected, 0);
+            assert!(menu.title().contains("Esc"));
+        }
+        assert_eq!(MAIN_ITEMS.len(), MAIN_LABELS.len());
+        assert_eq!(SETTINGS_ITEMS.len(), SETTINGS_LABELS.len());
+        assert_eq!(REPO_ACTION_ITEMS.len(), REPO_ACTION_LABELS.len());
+    }
+
+    // -------------------- directory prompt --------------------
+
+    #[test]
+    fn dir_prompt_prefills_the_current_dir_and_resolves_it_back() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+        let dir = home.join("Documents/code");
+        let prompt = DirectoryPrompt::new(&dir, true);
+        // Shown tilde-shortened, saved absolute.
+        assert_eq!(prompt.line.input, "~/Documents/code");
+        assert_eq!(prompt.resolved_path(), dir);
+    }
+
+    #[test]
+    fn dir_prompt_absolutizes_a_relative_entry() {
+        let mut prompt = DirectoryPrompt::new(Path::new("/tmp"), true);
+        prompt.line = InputLine::new("  relative/dir  ".to_string());
+        let resolved = prompt.resolved_path();
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with("relative/dir"));
+    }
+}
