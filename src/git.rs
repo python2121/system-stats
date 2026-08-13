@@ -118,8 +118,8 @@ impl Scanner {
         self.refresh();
     }
 
-    // Kick off a refresh of the current root right now — used by the manual
-    // 'r' binding and after a pull completes, so ahead/behind counts update
+    // Kick off a full refresh of the current root right now — used by the
+    // manual Shift-R binding and by set_root, so ahead/behind counts update
     // without waiting for the tick.
     //
     // Pokes both threads: the scan lands local state within milliseconds,
@@ -132,7 +132,8 @@ impl Scanner {
     }
 
     // Local-only refresh: re-reads working trees and refs already on disk
-    // without hitting the network.
+    // without hitting the network. Used by the manual 'r' binding and after
+    // a pull, which has already fetched.
     pub fn rescan(&self) {
         let _ = self.wake_tx.send(());
     }

@@ -1736,21 +1736,13 @@ impl App {
             self.switch_tab(delta);
             return;
         }
-        // On the git status tab, 'r' forces an immediate refresh no matter
-        // which pane holds focus (activity list, graph, or full-screen
-        // inspect) — checked before the inspect handler, which otherwise
-        // swallows every unbound key. Skip when a modifier is held so
-        // Ctrl-C and friends still reach the shared handler.
-        //
-        // Full refresh, not just a local rescan: ahead/behind against the
-        // remote is the count most likely to be stale, and a "refresh" that
-        // can't update it is a surprise. The local scan still lands
-        // immediately; the fetch follows on its own thread.
-        if self.selected_tab == Tab::GitStatus
-            && key.code == KeyCode::Char('r')
-            && key.modifiers.is_empty()
-        {
-            self.scanner.refresh();
+        // The refresh keys are checked before the inspect handler below,
+        // which otherwise swallows every unbound key.
+        if let Some(kind) = refresh_request(self.selected_tab, key) {
+            match kind {
+                RefreshKind::Local => self.scanner.rescan(),
+                RefreshKind::WithFetch => self.scanner.refresh(),
+            }
             return;
         }
         // The full-screen inspect view swallows everything except quit
@@ -1850,6 +1842,36 @@ impl App {
             }
             _ => {}
         }
+    }
+}
+
+// The two weights of manual git refresh.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RefreshKind {
+    // 'r' — re-read working trees and refs already on disk. Lands in
+    // milliseconds and never touches the network.
+    Local,
+    // Shift-R — also fetch remote-tracking refs, so ahead/behind against
+    // the remote updates. Right but slow: the fetch runs serially across
+    // every repo under the root.
+    WithFetch,
+}
+
+// What a keypress asks the git scanner to do, if anything. Both keys work
+// from any pane on the Git tab (activity list, graph, full-screen inspect),
+// which is why this is checked ahead of the per-pane handlers.
+//
+// Only SHIFT may be held: Ctrl-R and friends fall through to the shared
+// handler. Terminals report Shift-R as 'R' with SHIFT set, so we match on
+// the character and ignore the redundant modifier.
+fn refresh_request(tab: Tab, key: KeyEvent) -> Option<RefreshKind> {
+    if tab != Tab::GitStatus || !(key.modifiers - KeyModifiers::SHIFT).is_empty() {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('r') => Some(RefreshKind::Local),
+        KeyCode::Char('R') => Some(RefreshKind::WithFetch),
+        _ => None,
     }
 }
 
@@ -2756,7 +2778,7 @@ fn draw_right_pane(f: &mut Frame, app: &App, area: Rect) {
             // Round to 5-second increments so the title doesn't flicker every tick.
             let rounded = (tree.scanned_at.elapsed().as_secs() / 5) * 5;
             let hint = if focused { " (↑/↓ select) " } else { " " };
-            // A fetch runs for seconds after 'r'; without this the keypress
+            // A fetch runs for seconds after Shift-R; without this the keypress
             // reads as a no-op until the ahead/behind counts quietly change.
             let fetching = if app.scanner.is_fetching() {
                 " · fetching…"
@@ -2767,6 +2789,17 @@ fn draw_right_pane(f: &mut Frame, app: &App, area: Rect) {
                 " Git activity — {} repos in {}  (scanned {}s ago{fetching}){hint}",
                 tree.total_repos, tree.root_display, rounded,
             );
+            // Refresh keys sit on the bottom edge, out of the way of the
+            // title's live numbers. Shown whether or not the pane holds
+            // focus, since they work from any pane on this tab (unlike
+            // ↑/↓); both weights are named because "r rescan" alone reads
+            // as the only refresh there is, which is the stale
+            // ahead/behind trap R exists to avoid.
+            let keys = Line::styled(
+                " r rescan · R rescan+fetch ",
+                Style::default().fg(Color::DarkGray),
+            )
+            .right_aligned();
             let (lines, extents) =
                 render_git_tree(tree, app.selected_repo, app.git_pull.as_ref());
 
@@ -2802,7 +2835,7 @@ fn draw_right_pane(f: &mut Frame, app: &App, area: Rect) {
             let para = Paragraph::new(lines)
                 .style(Style::reset())
                 .scroll((scroll, 0))
-                .block(base_block.title(title));
+                .block(base_block.title(title).title_bottom(keys));
             f.render_widget(para, area);
         }
         None => {
