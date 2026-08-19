@@ -1,0 +1,6 @@
+# Rust 1.90+ defaults to lld on x86_64 Linux; environments where PATH
+# resolves `ld.lld` to a non-system toolchain (e.g. swiftly) break the
+# link step. Fall back to the platform's default linker on Linux only —
+# macOS targets are unaffected by this section.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Clinker-features=-lld"]
