@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -11,6 +12,12 @@ use crate::config;
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const FETCH_INTERVAL: Duration = Duration::from_secs(10 * 60);
+// Wall-clock ceiling for one network git command (fetch of a single repo,
+// or a pull). A fetch that connected right before the laptop slept can sit
+// on a half-open TCP socket forever after wake — ssh's ConnectTimeout only
+// covers the connect, and git itself never gives up. Past this, we kill it.
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(90);
+const PULL_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_REPOS: usize = 30;
 const MAX_BRANCHES_PER_REPO: usize = 8;
 const HEATMAP_LOOKBACK_DAYS: u32 = 400;
@@ -281,23 +288,88 @@ fn repo_paths(root: &Path) -> Option<Vec<PathBuf>> {
 
 // Refresh remote-tracking refs for every watched repo. Fetch is purely
 // additive: it downloads new commits and moves refs like origin/main, but
-// never touches local branches or the working tree. The env vars force git
-// to fail instead of prompting for credentials — a background thread has no
-// terminal to answer on, so a prompt would hang the fetch loop forever.
-// Repos that need interactive auth just stay stale until fetched manually.
+// never touches local branches or the working tree. Each repo's fetch is
+// bounded by NETWORK_TIMEOUT so one dead connection can't stall the whole
+// loop (and the "fetching…" label) indefinitely. Repos that need
+// interactive auth just stay stale until fetched manually.
 fn fetch_repos(root: &Path) {
     let Some(paths) = repo_paths(root) else {
         return;
     };
     for path in paths {
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(&path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes -oConnectTimeout=5")
-            .args(["fetch", "--all", "--quiet"])
-            .output();
+        let _ = run_network_git(&path, &["fetch", "--all", "--quiet"], NETWORK_TIMEOUT);
     }
+}
+
+// Build a git command that talks to the network from a background thread:
+// it must fail rather than prompt (no terminal to answer on), and must
+// notice a dead peer. ServerAlive makes ssh drop a session that stops
+// answering within ~30s; the http.lowSpeed pair does the same for HTTPS
+// remotes. Both are belt-and-braces under the hard kill in run_with_timeout.
+fn network_git(path: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -oBatchMode=yes -oConnectTimeout=5 -oServerAliveInterval=15 -oServerAliveCountMax=2",
+        )
+        .args(["-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=30"]);
+    cmd
+}
+
+fn run_network_git(path: &Path, args: &[&str], timeout: Duration) -> std::io::Result<Output> {
+    let mut cmd = network_git(path);
+    cmd.args(args);
+    run_with_timeout(cmd, timeout)
+}
+
+// Like Command::output(), but kills the child if it hasn't exited within
+// `timeout`. Returns Err(TimedOut) in that case. stdout/stderr are drained
+// on helper threads so a chatty child can't block on a full pipe while we
+// poll — the same deadlock Command::output() guards against internally.
+fn run_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Result<Output> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+
+    let drain = |pipe: Option<std::process::ChildStdout>, err: Option<std::process::ChildStderr>| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            } else if let Some(mut e) = err {
+                let _ = e.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout = drain(child.stdout.take(), None);
+    let stderr = drain(None, child.stderr.take());
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            // kill() can fail if the child exited between try_wait and here;
+            // wait() below reaps it either way. Closing the pipes on kill
+            // also makes any grandchild (ssh) exit on its next write.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("timed out after {}s", timeout.as_secs()),
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    Ok(Output { status, stdout, stderr })
 }
 
 pub struct PullOutcome {
@@ -310,17 +382,12 @@ pub struct PullOutcome {
 // never freezes the UI; the caller polls the returned channel each tick.
 // `--ff-only` because there's no terminal to resolve a merge or conflicts
 // in — if the branch has diverged the pull fails with git's message and
-// the repo is left untouched. Same no-prompt env vars as fetch_repos.
+// the repo is left untouched. Same no-prompt, dead-peer-aware setup as
+// fetch_repos, with a longer ceiling since a pull may download real data.
 pub fn spawn_pull(repo: String, path: PathBuf) -> Receiver<PullOutcome> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes -oConnectTimeout=5")
-            .args(["pull", "--ff-only"])
-            .output();
+        let out = run_network_git(&path, &["pull", "--ff-only"], PULL_TIMEOUT);
         let outcome = match out {
             Ok(o) if o.status.success() => PullOutcome {
                 repo,
@@ -845,6 +912,42 @@ fn git_is_dirty(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_with_timeout_returns_output_of_a_fast_command() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo out; echo err >&2; exit 3"]);
+        let out = run_with_timeout(cmd, Duration::from_secs(10)).unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "out\n");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "err\n");
+    }
+
+    #[test]
+    fn run_with_timeout_kills_a_hung_command() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let started = Instant::now();
+        let err = run_with_timeout(cmd, Duration::from_millis(300)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5), "kill didn't cut the wait short");
+    }
+
+    #[test]
+    fn network_git_never_prompts_and_detects_dead_peers() {
+        let cmd = network_git(Path::new("/tmp"));
+        let env: Vec<(String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_string_lossy().into_owned(), v?.to_string_lossy().into_owned())))
+            .collect();
+        assert!(env.iter().any(|(k, v)| k == "GIT_TERMINAL_PROMPT" && v == "0"));
+        let ssh = &env.iter().find(|(k, _)| k == "GIT_SSH_COMMAND").unwrap().1;
+        for opt in ["BatchMode=yes", "ConnectTimeout=", "ServerAliveInterval=", "ServerAliveCountMax="] {
+            assert!(ssh.contains(opt), "missing {opt} in {ssh}");
+        }
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.contains(&"http.lowSpeedTime=30".to_string()));
+    }
 
     // ---------- %(upstream:track) ----------
 
