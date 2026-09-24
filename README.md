@@ -1,8 +1,8 @@
 # system-stats
 
-A terminal dashboard for macOS developers. One window with five tabs: your git activity across every project you're working on, your [Claude Code](https://code.claude.com) sessions (with live status and cost estimates), and per-app process, network, and disk/power monitoring — built with [ratatui](https://ratatui.rs).
+A terminal dashboard for developers on macOS and Linux. One window with up to five tabs: your git activity across every project you're working on, your [Claude Code](https://code.claude.com) sessions (with live status and cost estimates), and per-app process, network, and disk/power monitoring — built with [ratatui](https://ratatui.rs).
 
-No daemons, no root, no config beyond picking a directory to watch. Everything is read live from `git`, `nettop`, `ioreg`, `diskutil`, and Claude Code's local session files.
+No daemons, no root, no config beyond picking a directory to watch. Everything is read live from `git`, Claude Code's local session files, and the OS's own counters — `nettop`, `ioreg`, and `diskutil` on macOS; `/proc`, `/sys`, and `lsblk` on Linux.
 
 ## Screenshots
 
@@ -35,17 +35,17 @@ Maps each project under the watch directory to its Claude Code session history (
 
 Per-application CPU and memory, with helper processes folded into their parent app the way Activity Monitor does (all the Chrome helpers are just "Google Chrome"). System-wide CPU/memory charts, per-app sparklines, and a drill-down listing every member process.
 
-### Network
+### Network (macOS only)
 
 Per-application bandwidth from `nettop`, aggregated the same way. Download/upload charts, per-app share bars and sparklines, and a drill-down showing every remote host the app is talking to — reverse-DNS resolved, with connection counts and per-host rates.
 
 ### Disk / Power
 
-Disk read/write throughput, IOPS, and latency from cumulative driver counters; mounted volumes with fill gauges (plus unmounted partitions, e.g. a Linux dual-boot); and battery telemetry straight from the SMC — a signed watts flow chart (amber draining, green charging), charge and health gauges, cycle count, per-cell voltages, temperatures, and the negotiated USB-PD contract.
+Disk read/write throughput, IOPS, and latency from cumulative driver counters; mounted volumes with fill gauges (plus unmounted partitions, e.g. a Linux dual-boot); and battery telemetry — a signed watts flow chart (amber draining, green charging), charge and health gauges, and cycle count. On macOS this comes straight from the SMC and adds per-cell voltages, temperatures, and the negotiated USB-PD contract; on Linux it's read from `/sys/class/power_supply` and `/proc/diskstats`, so those Apple-specific extras stay empty.
 
 ## Requirements
 
-- **macOS** — the network, disk, and power tabs shell out to `nettop`, `ioreg`, and `diskutil`
+- **macOS or Linux** — the Network tab is macOS-only (it depends on `nettop`) and is hidden from the tab strip on Linux; everything else works on both
 - **git** on your PATH
 - **Rust toolchain** to build ([rustup.rs](https://rustup.rs))
 - Optional: **Claude Code** for the Claude tab (it degrades to an empty tab without it); resuming sessions in Ghostty requires Ghostty ≥ 1.3
