@@ -21,6 +21,8 @@
 // forks collapsing through each other → `┴`) fall out of one table
 // instead of special cases.
 
+use std::collections::HashSet;
+
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
@@ -54,6 +56,9 @@ struct Cell {
     node: bool,
     merge: bool,
     ghost: bool,
+    // Last stretch of a lane whose expected commit is older than the
+    // window — drawn dotted (┆) so it reads as "continues off-screen".
+    fade: bool,
     // Palette slot that owns this cell's color. Verticals claim their
     // cell first, so a horizontal run crossing a rail leaves the rail's
     // color intact (`┼` keeps the through-lane's hue) while pure
@@ -72,6 +77,11 @@ struct Lane {
     // on this lane bearing no ref, it's the final commit of a branch
     // that was merged and then deleted — drawn hollow (○).
     merge_born: bool,
+    // The commit this lane waits for isn't in the window. Rather than
+    // rail it to the bottom (wide merge-heavy repos accumulate dozens of
+    // these, shoving the commit text off-screen), it draws one dotted
+    // stub on the next row and frees its column.
+    offscreen: bool,
 }
 
 // Least-used palette slot among the live lanes, lowest index winning
@@ -129,6 +139,9 @@ impl Cell {
                 '●'
             };
         }
+        if self.fade && self.up && !self.down && !self.left && !self.right {
+            return '┆';
+        }
         match (self.up, self.down, self.left, self.right) {
             (true, true, false, false) => '│',
             (false, false, true, true) => '─',
@@ -182,6 +195,7 @@ pub fn layout(commits: &[GraphRow]) -> Layout {
         .find(|c| c.refs.iter().any(|r| is_trunk_ref(r)))
         .map(|c| c.sha.as_str());
     let mut trunk_pending = trunk_sha.is_some();
+    let in_window: HashSet<&str> = commits.iter().map(|c| c.sha.as_str()).collect();
 
     for commit in commits {
         if trunk_pending && lanes.is_empty() {
@@ -204,6 +218,19 @@ pub fn layout(commits: &[GraphRow]) -> Layout {
         // Lanes born on this row have no rail above yet, so a second
         // connection into them must not set the `up` bit.
         let mut born: Vec<usize> = Vec::new();
+
+        // Lanes waiting on a commit outside the window get their dotted
+        // stub this row and end. They stay `Some` until the row is done,
+        // so nothing reallocates the column mid-row.
+        for (i, lane) in lanes.iter().enumerate() {
+            if lane.as_ref().is_some_and(|l| l.offscreen) {
+                grow(&mut cells, 2 * i);
+                let color = lane.as_ref().map_or(0, |l| l.color);
+                cells[2 * i].add(true, false, false, false, color);
+                cells[2 * i].fade = true;
+                freed.push(i);
+            }
+        }
 
         let is_trunk_row = trunk_pending && Some(commit.sha.as_str()) == trunk_sha;
         if is_trunk_row {
@@ -243,7 +270,7 @@ pub fn layout(commits: &[GraphRow]) -> Layout {
             if i == node_lane || matches.contains(&i) {
                 continue;
             }
-            if let Some(lane) = lane {
+            if let Some(lane) = lane.as_ref().filter(|l| !l.offscreen) {
                 grow(&mut cells, 2 * i);
                 cells[2 * i].add(true, true, false, false, lane.color);
             }
@@ -296,6 +323,7 @@ pub fn layout(commits: &[GraphRow]) -> Layout {
                     expects: p.clone(),
                     color: node_color,
                     merge_born: false,
+                    offscreen: !in_window.contains(p.as_str()),
                 });
                 cells[2 * node_lane].down = true;
             }
@@ -320,6 +348,7 @@ pub fn layout(commits: &[GraphRow]) -> Layout {
                         expects: p.clone(),
                         color,
                         merge_born: true,
+                        offscreen: !in_window.contains(p.as_str()),
                     });
                     born.push(k);
                     (k, color)
@@ -572,16 +601,23 @@ mod tests {
         // A fork's horizontal run is painted before the merge lane is
         // born in a column it crosses — the newborn's ┬ elbow must wear
         // the new branch's color, not the run's (seen live in
-        // claude-usage's "Merge PR #28" row).
-        let commits = [
-            commit("t0", &["m"]),   // lane 0
-            commit("t1", &["z"]),   // lane 1 — stays busy, gets crossed
-            commit("t2", &["q"]),   // lane 2 — will free up before the merge
-            commit("t3", &["m"]),   // lane 3 — collapses across everything
-            commit("q", &[]),       // root: frees lane 2 (lane 3 keeps it un-trimmed)
-            commit("m", &["w", "v"]),
-        ];
-        let l = layout(&commits);
+        // claude-usage's "Merge PR #28" row). Every parent lives in the
+        // window, so no lane fades out early.
+        let commits = |extra: Option<GraphRow>| -> Vec<GraphRow> {
+            [
+                commit("t0", &["m"]),   // lane 0
+                commit("t1", &["z"]),   // lane 1 — stays busy, gets crossed
+                commit("t2", &["q"]),   // lane 2 — will free up before the merge
+                commit("t3", &["m"]),   // lane 3 — collapses across everything
+                commit("q", &[]),       // root: frees lane 2 (lane 3 keeps it un-trimmed)
+                commit("m", &["w", "v"]),
+            ]
+            .into_iter()
+            .chain(extra)
+            .chain([commit("z", &[]), commit("w", &[]), commit("v", &[])])
+            .collect()
+        };
+        let l = layout(&commits(None));
         assert_eq!(
             l.rows[5].iter().map(Cell::glyph).collect::<String>(),
             "◉─┼─┬─╯",
@@ -591,11 +627,7 @@ mod tests {
         let newborn = l.rows[5][4].color;
         assert_ne!(newborn, l.rows[5][6].color, "┬ must not copy the ╯'s hue");
         // And the elbow matches the rail it feeds on the next row.
-        let commits: Vec<GraphRow> = commits
-            .into_iter()
-            .chain([commit("k", &["z2"])])
-            .collect();
-        let l = layout(&commits);
+        let l = layout(&commits(Some(commit("k", &["z"]))));
         assert_eq!(l.rows[6][4].color, newborn);
     }
 
@@ -648,6 +680,24 @@ mod tests {
                 row.subject
             );
         }
+    }
+
+    #[test]
+    fn parents_outside_the_window_fade_instead_of_railing_down() {
+        // m merges a PR based on an old commit the window doesn't hold;
+        // that lane gets one dotted stub and frees its column, so later
+        // rows stay narrow instead of carrying a rail to the bottom.
+        let rows = render(&[
+            commit("m", &["c", "old"]),
+            commit("c", &["b"]),
+            commit("b", &["a"]),
+            commit("a", &[]),
+        ]);
+        assert_eq!(rows, vec!["◉─╮", "● ┆", "●", "●"]);
+        // Same for a first parent: a branch tip whose history predates
+        // the window.
+        let rows = render(&[commit("t", &["old"]), commit("a", &[])]);
+        assert_eq!(rows, vec!["●", "┆ ●"]);
     }
 
     #[test]
