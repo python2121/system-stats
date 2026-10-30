@@ -1,4 +1,5 @@
 mod claude;
+mod cli;
 mod config;
 mod git;
 mod graph;
@@ -1464,6 +1465,7 @@ impl App {
     // `d` on a highlighted custom action removes it from the config (and
     // disk). Inert on built-in items and the "Custom…" entry.
     fn menu_delete_custom(&mut self) {
+        self.refresh_config();
         let Some(top) = self.menu_stack.last() else { return };
         if top.kind != MenuKind::RepoAction {
             return;
@@ -1606,6 +1608,7 @@ impl App {
     // Like the directory prompt, in-memory config only changes once the
     // file did, and a no-op accept skips the write.
     fn submit_command_prompt(&mut self) {
+        self.refresh_config();
         let Some(prompt) = self.command_prompt.as_mut() else { return };
         let Some(command) = config::normalize_claude_command(&prompt.line.input) else {
             prompt.error = Some("command can't be empty".to_string());
@@ -1624,6 +1627,7 @@ impl App {
     }
 
     fn submit_dir_prompt(&mut self) {
+        self.refresh_config();
         let Some(prompt) = self.dir_prompt.as_mut() else { return };
         let resolved = prompt.resolved_path();
         if !resolved.is_dir() {
@@ -1649,25 +1653,51 @@ impl App {
         // Only touch the scanners + per-tab state when the path actually
         // moved. A no-op accept shouldn't churn a rescan.
         if !same_path {
-            self.claude_scanner.set_root(resolved.clone());
-            self.claude_tree = None;
-            self.claude_selected = None;
-            self.claude_detail = None;
-            self.claude_scroll.set(0);
-            self.claude_detail_scroll.set(0);
-            self.claude_session_selected = None;
-            self.scanner.set_root(resolved);
-            self.git_tree = None;
-            self.graph_cache.clear();
-            self.stats_cache.clear();
-            self.selected_repo = None;
-            self.git_inspect = None;
-            self.inspect_scroll = 0;
-            self.left_scroll = 0;
-            self.right_scroll.set(0);
-            self.focus = Focus::Tabs;
+            self.switch_watch_dir(resolved);
         }
         self.dir_prompt = None;
+    }
+
+    // Point both scanners at a new root and drop every piece of per-tab
+    // state that referred to the old tree.
+    fn switch_watch_dir(&mut self, resolved: PathBuf) {
+        self.claude_scanner.set_root(resolved.clone());
+        self.claude_tree = None;
+        self.claude_selected = None;
+        self.claude_detail = None;
+        self.claude_scroll.set(0);
+        self.claude_detail_scroll.set(0);
+        self.claude_session_selected = None;
+        self.scanner.set_root(resolved);
+        self.git_tree = None;
+        self.graph_cache.clear();
+        self.stats_cache.clear();
+        self.selected_repo = None;
+        self.git_inspect = None;
+        self.inspect_scroll = 0;
+        self.left_scroll = 0;
+        self.right_scroll.set(0);
+        self.focus = Focus::Tabs;
+    }
+
+    // Re-read the config from disk so edits made outside the app — the
+    // `system-stats action` CLI, a hand edit, another Claude — show up
+    // without a restart and are never overwritten by a save of a stale
+    // in-memory copy. Called at the moments that matter (opening the repo
+    // menu, right before any save) rather than polled, so an idle app
+    // doesn't touch the disk. A missing file (first launch) keeps the
+    // in-memory config.
+    fn refresh_config(&mut self) {
+        let Some(fresh) = Config::load() else { return };
+        if fresh.watch_dir != self.config.watch_dir {
+            self.switch_watch_dir(fresh.watch_dir.clone());
+        }
+        self.config = fresh;
+        // The repo menu's custom rows may have grown or shrunk under the
+        // cursor; re-clamp if it's open.
+        if !self.menu_stack.is_empty() {
+            self.menu_move(0);
+        }
     }
 
     fn handle_events(&mut self) -> std::io::Result<()> {
@@ -1854,6 +1884,7 @@ impl App {
     // Commit the action editor: validate → append to config → write to disk.
     // Failures leave the editor open with an error so nothing is lost.
     fn submit_action_prompt(&mut self) {
+        self.refresh_config();
         let Some(prompt) = self.action_prompt.as_mut() else { return };
         let name = prompt.name.input.trim().to_string();
         let command = prompt.command.input.trim().to_string();
@@ -2003,7 +2034,12 @@ impl App {
                                 self.inspect_scroll = 0;
                             }
                         }
-                        Focus::Right => self.menu_stack.push(Menu::repo_action()),
+                        Focus::Right => {
+                            // Pick up actions added from outside the app
+                            // since the menu was last opened.
+                            self.refresh_config();
+                            self.menu_stack.push(Menu::repo_action());
+                        }
                         Focus::Tabs => {}
                     }
                 }
@@ -2044,6 +2080,12 @@ fn refresh_request(tab: Tab, key: KeyEvent) -> Option<RefreshKind> {
 }
 
 fn main() -> std::io::Result<()> {
+    // `system-stats action …` (and --help) runs the non-interactive CLI
+    // and exits; a bare invocation starts the TUI.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        std::process::exit(cli::run(&args));
+    }
     let mut terminal = ratatui::init();
     let mut app = App::new();
     let result = run(&mut terminal, &mut app);
